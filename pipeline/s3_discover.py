@@ -54,6 +54,34 @@ _ACTOR_LINKEDIN_JOBS  = "hKByXkMQaC5Qt9UMN"
 _ACTOR_WELLFOUND      = "sqkHGNG0toRTR3ORV"   # clearpath/wellfound-api-ppe
 _ACTOR_LINKEDIN_POSTS = "buIWk2uOUzTmcLsuB"
 
+# Global Tavily throttle — one call at a time across ALL concurrent pipeline runs
+import threading as _threading
+_TAVILY_LOCK = _threading.Semaphore(1)
+
+# Known MNCs / public companies — skip Tavily enrichment, assign stage directly
+_KNOWN_MNC: set[str] = {
+    "amazon", "apple", "google", "microsoft", "meta", "netflix",
+    "swiggy", "zomato", "flipkart", "meesho", "paytm", "phonepe",
+    "reliance", "reliance retail", "reliance industries",
+    "tata", "tcs", "tata consultancy services", "infosys", "wipro",
+    "hcl", "hcl technologies", "tech mahindra", "l&t", "ltimindtree",
+    "hdfc", "hdfc bank", "icici", "icici bank", "idfc first bank",
+    "axis bank", "kotak mahindra bank", "sbi", "state bank of india",
+    "aditya birla", "aditya birla capital", "aditya birla group",
+    "itc", "itc limited", "itc hotels limited",
+    "unilever", "hindustan unilever", "p&g", "nestle", "britannia",
+    "accenture", "ibm", "deloitte", "pwc", "kpmg", "ey",
+    "spotify", "adobe", "salesforce", "oracle", "sap",
+    "vedantu", "byju's", "unacademy", "upgrad",
+    "taskus", "concentrix", "teleperformance",
+    "sgs", "the lubrizol corporation", "lubrizol",
+    "forbidden foods", "forbidden foods (brb popped chips)",
+}
+
+def _is_mnc(company: str) -> bool:
+    """Return True if company is a known large company — skip Tavily lookup."""
+    return company.lower().strip() in _KNOWN_MNC
+
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
@@ -622,12 +650,18 @@ def _enrich_hiring_managers(leads: list[RawLead]) -> list[RawLead]:
 
     def _lookup(lead: RawLead) -> tuple[RawLead, Optional[str], Optional[str]]:
         import time
+        # Skip known MNCs — no point cold-emailing Jeff Bezos
+        if _is_mnc(lead.company_name):
+            log.debug("S3: Skipping MNC manager lookup for %s", lead.company_name)
+            return lead, None, None
         try:
-            results = tavily_search(
-                f'"{lead.company_name}" CEO founder LinkedIn startup India',
-                max_results=3,
-                days_back=365,
-            )
+            with _TAVILY_LOCK:  # global lock — one call at a time across all runs
+                results = tavily_search(
+                    f'"{lead.company_name}" CEO founder LinkedIn startup India',
+                    max_results=3,
+                    days_back=365,
+                )
+                time.sleep(0.8)   # stay under Tavily free-tier rate limit
             if not results:
                 return lead, None, None
             combined = " ".join(
@@ -647,7 +681,6 @@ def _enrich_hiring_managers(leads: list[RawLead]) -> list[RawLead]:
                 ),
                 schema=_ManagerResult,
             )
-            time.sleep(0.7)   # stay under Tavily free-tier rate limit (~1 req/sec)
             return lead, extracted.name, extracted.linkedin_url
         except Exception as e:
             log.warning("S3: Manager lookup failed for %s: %s", lead.company_name, e)
@@ -703,12 +736,18 @@ def _enrich_company_stages(leads: list[RawLead]) -> list[RawLead]:
     def _lookup_stage(company: str) -> tuple[str, str]:
         """Return (company_name, stage_label). Fails silently → 'unknown'."""
         import time
+        # Instantly classify known MNCs without any API call
+        if _is_mnc(company):
+            log.debug("S3: MNC shortcut for %s", company)
+            return company, "mnc"
         try:
-            results = tavily_search(
-                f'"{company}" startup funding stage India investors',
-                max_results=3,
-                days_back=365,
-            )
+            with _TAVILY_LOCK:  # global lock — one call at a time across all runs
+                results = tavily_search(
+                    f'"{company}" startup funding stage India investors',
+                    max_results=3,
+                    days_back=365,
+                )
+                time.sleep(0.8)   # stay under Tavily free-tier rate limit
             if not results:
                 return company, "unknown"
             combined = " ".join(r.get("content", "") for r in results)[:1500]
@@ -721,7 +760,6 @@ def _enrich_company_stages(leads: list[RawLead]) -> list[RawLead]:
                 ),
                 schema=_StageExtract,
             )
-            time.sleep(0.7)   # stay under Tavily free-tier rate limit (~1 req/sec)
             return company, extracted.stage_label
         except Exception as e:
             log.warning("S3: Stage lookup failed for %s: %s", company, e)
