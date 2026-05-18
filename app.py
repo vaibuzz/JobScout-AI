@@ -665,6 +665,22 @@ def _restore_from_query_params():
             except Exception as e:
                 log.warning("Could not restore scored leads: %s", e)
 
+        # If restoring to 'searching' view, check DB status to avoid re-triggering actors
+        if view == "searching":
+            try:
+                from db.queries import get_candidate as _gc
+                _cand = _gc(cid)
+                _db_status = _cand.get("pipeline_status") if _cand else None
+                if _db_status == "ranked":
+                    # Already done — go straight to results
+                    view = "results"
+                elif _db_status not in ["discovering", "ranking", "discovered"]:
+                    # Not in progress and not done — fall back to confirmed (re-run from there)
+                    view = "confirmed"
+                # Otherwise keep view='searching' so the polling loop picks it up
+            except Exception:
+                view = "confirmed"
+
         # Restore selected_match_id for draft / dossier
         mid = params.get("mid")
         if mid:
@@ -938,19 +954,48 @@ def _run_searching():
             _reset()
         return
 
-    # ── Layer 1: Supabase-level dedup guard (cross-process) ───────────────────
-    # Checks the DB pipeline_status flag. This works across Streamlit Cloud
-    # workers (multiple Python processes) where threading.Lock is useless.
+    import time
+    from db.queries import get_matches_for_candidate
+
     existing = get_candidate(cid)
-    if existing and existing.get("pipeline_status") == "discovering":
-        st.info("⏳ Pipeline is already running for this candidate — please wait.")
-        st.button("🔄 Refresh status", on_click=lambda: None)
+    db_status = existing.get("pipeline_status") if existing else None
+
+    # ── Layer 1: DB status guard — covers ALL terminal and in-progress states ──
+    # This is the primary defence against re-triggering actors on page refresh.
+
+    if db_status == "ranked":
+        # Pipeline fully done — load from DB and go to results.
+        st.success("✅ Pipeline complete! Loading results...")
+        matches = get_matches_for_candidate(cid)
+        st.session_state.scored_leads = [
+            {**m, "job_id": m.get("job_id")} for m in matches
+        ]
+        st.session_state.error_msg = None
+        st.session_state._is_searching = False
+        time.sleep(1)
+        _goto("results")
+        return
+
+    if db_status in ["discovering", "discovered", "ranking"]:
+        # Actors are running or have just finished — poll every 3 seconds.
+        st.warning(f"⏳ Pipeline is currently {db_status}... auto-refreshing.")
+        time.sleep(3)
+        st.rerun()
+        return
+
+    # ── Layer 2: session_state guard — same-process safety within one session ──
+    # Prevents double-fire within the same Streamlit worker process.
+    if st.session_state.get("_is_searching", False):
+        st.warning("⏳ Pipeline is already running — please wait.")
+        time.sleep(3)
+        st.rerun()
         return
 
     # ── Layer 2: In-process thread lock (same process safety) ─────────────────
     if not _PIPELINE_LOCK.acquire(blocking=False):
-        st.info("⏳ Pipeline is already running — please wait for results.")
-        st.button("🔄 Refresh status", on_click=lambda: None)
+        st.warning("⏳ Pipeline is already running — please wait for results.")
+        time.sleep(3)
+        st.rerun()
         return
 
     try:
