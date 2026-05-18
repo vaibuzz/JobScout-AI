@@ -19,6 +19,8 @@ Output: list[ScoredLead] sorted by final_score descending, persisted to matches 
 """
 import os
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Optional
 from pydantic import BaseModel, Field
@@ -142,28 +144,35 @@ def rank_leads(candidate_id: str, candidate_model: CandidateModel) -> list[Score
         update_match_initial_score(match["id"], score, breakdown)
 
     # ── Phase 1.5: Gemini pre-filter top-N direct leads → pick DIRECT_QUOTA ──
-    # Python top-30 go into Gemini batch-of-5 scoring. Gemini understands role
-    # semantics and company context far better than fuzzy matching alone.
-    # Only the top DIRECT_QUOTA (12) survivors go forward to Phase 2.
     valid_direct = sorted(
         [m for m in direct_matches if (m.get("initial_score") or 0) > 0],
         key=lambda x: x.get("initial_score", 0),
         reverse=True,
     )
     prefilter_pool = valid_direct[:DIRECT_PREFILTER_SIZE]
-    if len(prefilter_pool) > DIRECT_QUOTA:
-        log.info(
-            "S4[1.5]: Gemini pre-filter: %d direct leads → picking top %d",
-            len(prefilter_pool), DIRECT_QUOTA,
-        )
-        top_direct = _gemini_prefilter_direct(prefilter_pool, candidate_model)
-    else:
-        top_direct = prefilter_pool   # Not enough leads to bother pre-filtering
 
-    # ── Phase 1B: Gemini initial scoring for indirect leads ───────────────────
-    if indirect_matches:
-        log.info("S4[1B]: Scoring %d indirect leads (Gemini batch-of-5)", len(indirect_matches))
-        _score_indirect_initial_all(indirect_matches, candidate_model)
+    # ── Run Phase 1.5 (direct prefilter) + Phase 1B (indirect) IN PARALLEL ────
+    # Both are Gemini-heavy batch jobs with no data dependency on each other.
+    # Running them concurrently cuts Phase 1 wall-clock time roughly in half.
+    log.info(
+        "S4: Starting Phase 1.5 (%d direct) + Phase 1B (%d indirect) in parallel",
+        len(prefilter_pool), len(indirect_matches),
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_prefilter = executor.submit(
+            _gemini_prefilter_direct, prefilter_pool, candidate_model
+        ) if len(prefilter_pool) > DIRECT_QUOTA else None
+
+        future_indirect = executor.submit(
+            _score_indirect_initial_all, indirect_matches, candidate_model
+        ) if indirect_matches else None
+
+        top_direct = future_prefilter.result() if future_prefilter else prefilter_pool
+        if future_indirect:
+            future_indirect.result()   # Modifies indirect_matches in-place; wait for completion
+
+    log.info("S4: Phase 1 complete — %d direct + %d indirect ready for quota selection",
+             len(top_direct), len(indirect_matches))
 
     # ── Quota selection ───────────────────────────────────────────────────────
     quota_matches = _select_quota(top_direct, indirect_matches)
@@ -372,12 +381,16 @@ def _score_indirect_initial_all(
 ):
     """
     Phase 1B: Gemini initial scoring for all indirect leads.
-    Processes in batches of 5. Writes initial_score to each match dict and to DB.
+    Processes batches of 5 in parallel (max 3 concurrent Gemini calls).
+    Writes initial_score to each match dict and to DB.
     """
     context = _build_candidate_context(candidate_model, include_aliases=False)
     system  = f"{_INDIRECT_SCORE_SYSTEM}\n\nCANDIDATE:\n{context}"
+    batches = list(chunk_list(indirect_matches, 5))
 
-    for batch in chunk_list(indirect_matches, 5):
+    _lock = threading.Lock()   # Protect in-place writes to shared list items
+
+    def _score_one_batch(batch: list[dict]) -> None:
         posts_text = "\n\n".join(
             f"[{i}] Company: {m.get('company_name', 'Unknown')}\n"
             f"    Role: {m.get('role_title', 'Unknown')}\n"
@@ -395,17 +408,26 @@ def _score_indirect_initial_all(
                     m         = batch[item.post_index]
                     score     = round(item.score, 2)
                     breakdown = {"gemini_scored": True, "reason": item.reason}
-                    m["initial_score"]           = score
-                    m["initial_score_breakdown"] = breakdown
+                    with _lock:
+                        m["initial_score"]           = score
+                        m["initial_score_breakdown"] = breakdown
                     update_match_initial_score(m["id"], score, breakdown)
-
         except Exception as e:
             log.error("S4[1B]: Gemini indirect scoring failed for batch: %s", e)
             for m in batch:
                 if "initial_score" not in m:
-                    m["initial_score"]           = 50.0   # Neutral fallback
-                    m["initial_score_breakdown"] = {"gemini_scored": False, "error": str(e)}
-                    update_match_initial_score(m["id"], 50.0, m["initial_score_breakdown"])
+                    fallback  = {"gemini_scored": False, "error": str(e)}
+                    with _lock:
+                        m["initial_score"]           = 50.0
+                        m["initial_score_breakdown"] = fallback
+                    update_match_initial_score(m["id"], 50.0, fallback)
+
+    log.info("S4[1B]: Scoring %d indirect leads in %d parallel batches",
+             len(indirect_matches), len(batches))
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(_score_one_batch, batch) for batch in batches]
+        for future in as_completed(futures):
+            future.result()   # Re-raise any exceptions
 
 
 # ── Phase 1.5: Gemini Direct Lead Pre-filter ─────────────────────────────────
@@ -441,20 +463,17 @@ def _gemini_prefilter_direct(
     candidate_model: CandidateModel,
 ) -> list[dict]:
     """
-    Phase 1.5: Send top-N direct leads (from Python Phase 1A) through Gemini
-    batch-of-5 scoring. Returns top DIRECT_QUOTA leads by Gemini score.
-
-    This is a lightweight semantic filter — no axis breakdown, just an
-    overall 0-100 score. Ensures the 12 direct leads going to Phase 2 are
-    the semantically strongest matches, not just the highest Python scores.
+    Phase 1.5: Send top-N direct leads through Gemini batch-of-5 scoring.
+    Batches are processed IN PARALLEL (max 3 concurrent) for speed.
+    Returns top DIRECT_QUOTA leads by Gemini score.
     """
     context = _build_candidate_context(candidate_model, include_aliases=True)
     system  = f"{_PREFILTER_SYSTEM}\n\nCANDIDATE:\n{context}"
-
+    batches = list(chunk_list(pool, 5))
     scores: dict[int, float] = {}   # pool_index → gemini_score
+    _lock = threading.Lock()
 
-    for batch_start, batch in enumerate(chunk_list(pool, 5)):
-        offset     = batch_start * 5
+    def _score_one_batch(batch: list[dict], offset: int) -> None:
         leads_text = "\n\n".join(
             f"Lead {offset + i}:\n"
             f"  Company: {m.get('company_name', 'Unknown')}\n"
@@ -470,28 +489,34 @@ def _gemini_prefilter_direct(
                 system=system,
                 schema=_PrefilterBatch,
             )
-            for item in result.scores:
-                if 0 <= item.lead_index < len(pool):
-                    scores[item.lead_index] = item.score
+            with _lock:
+                for item in result.scores:
+                    if 0 <= item.lead_index < len(pool):
+                        scores[item.lead_index] = item.score
         except Exception as e:
-            log.error("S4[1.5]: Gemini prefilter failed for batch: %s", e)
-            # Fallback: carry over Python initial_score for this batch
-            for i in range(len(batch)):
-                idx = offset + i
-                if idx not in scores:
-                    scores[idx] = (pool[idx].get("initial_score") or 0) * 10
+            log.error("S4[1.5]: Gemini prefilter failed for batch at offset %d: %s", offset, e)
+            with _lock:
+                for i in range(len(batch)):
+                    idx = offset + i
+                    if idx not in scores:
+                        scores[idx] = (pool[idx].get("initial_score") or 0) * 10
+
+    log.info("S4[1.5]: Pre-filtering %d leads in %d parallel batches",
+             len(pool), len(batches))
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [
+            executor.submit(_score_one_batch, batch, i * 5)
+            for i, batch in enumerate(batches)
+        ]
+        for future in as_completed(futures):
+            future.result()
 
     # Sort pool by Gemini prefilter score, return top DIRECT_QUOTA
-    ranked = sorted(
-        range(len(pool)),
-        key=lambda i: scores.get(i, 0),
-        reverse=True,
-    )
+    ranked = sorted(range(len(pool)), key=lambda i: scores.get(i, 0), reverse=True)
     top = [pool[i] for i in ranked[:DIRECT_QUOTA]]
     log.info(
         "S4[1.5]: Pre-filter complete — top %d from pool of %d (scores: %s)",
-        len(top),
-        len(pool),
+        len(top), len(pool),
         ", ".join(f"{scores.get(ranked[i], 0):.0f}" for i in range(len(top))),
     )
     return top
@@ -572,12 +597,15 @@ class _FinalScoreBatch(BaseModel):
 def _final_score_all(quota_matches: list[dict], candidate_model: CandidateModel):
     """
     Phase 2: Full Gemini scoring for all quota-selected leads in batches of 5.
+    Batches are processed IN PARALLEL (max 4 concurrent) for speed.
     Writes final_score, axis_scores, rationale to each match dict in-place.
     """
     context = _build_candidate_context(candidate_model, include_aliases=True)
     system  = f"{_FINAL_SCORE_SYSTEM}\n\nCANDIDATE:\n{context}"
+    batches = list(chunk_list(quota_matches, 5))
+    _lock   = threading.Lock()
 
-    for batch in chunk_list(quota_matches, 5):
+    def _score_one_batch(batch: list[dict]) -> None:
         leads_text = "\n\n".join(
             f"Lead {i}:\n"
             f"  Company: {m.get('company_name', 'Unknown')}\n"
@@ -597,35 +625,37 @@ def _final_score_all(quota_matches: list[dict], candidate_model: CandidateModel)
             for item in result.scores:
                 if 0 <= item.lead_index < len(batch):
                     m = batch[item.lead_index]
-                    m["axis_scores"]         = item.axis_scores.model_dump()
-                    m["rationale"]           = item.rationale
-                    m["company_stage_label"] = item.company_stage_label   # Gemini may correct unknown stage
-                    base_score               = compute_final_score(
+                    base_score = compute_final_score(
                         item.axis_scores.model_dump(),
                         item.company_stage_label,
                     )
-                    # Apply recency penalty so stale listings rank below fresh ones
-                    raw = round(
-                        min(base_score * _recency_multiplier(m.get("posted_at")), 100.0), 2
-                    )
-                    # Hard cap for MNC/Public that passed Phase 1 as "unknown" stage,
-                    # or for intern/trainee roles — these should never rank above 50
+                    raw = round(min(base_score * _recency_multiplier(m.get("posted_at")), 100.0), 2)
                     _stage_now = (item.company_stage_label or "").lower()
                     _role_now  = (m.get("role_title") or "").lower()
                     if _stage_now in ("mnc", "public"):
                         raw = min(raw, 50.0)
                     if any(kw in _role_now for kw in ("intern", "trainee", "apprentice")):
                         raw = min(raw, 45.0)
-                    m["final_score"] = raw
-
+                    with _lock:
+                        m["axis_scores"]         = item.axis_scores.model_dump()
+                        m["rationale"]           = item.rationale
+                        m["company_stage_label"] = item.company_stage_label
+                        m["final_score"]         = raw
         except Exception as e:
             log.error("S4[2]: Gemini final scoring failed for batch: %s", e)
             for m in batch:
                 if "final_score" not in m:
-                    # Fallback: scale initial_score (0–10) to (0–100)
-                    m["final_score"] = round((m.get("initial_score") or 5.0) * 10, 2)
-                    m["axis_scores"] = {}
-                    m["rationale"]   = "Scoring unavailable — using initial score as fallback"
+                    with _lock:
+                        m["final_score"] = round((m.get("initial_score") or 5.0) * 10, 2)
+                        m["axis_scores"] = {}
+                        m["rationale"]   = "Scoring unavailable — using initial score as fallback"
+
+    log.info("S4[2]: Final Gemini scoring for %d leads in %d parallel batches",
+             len(quota_matches), len(batches))
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(_score_one_batch, batch) for batch in batches]
+        for future in as_completed(futures):
+            future.result()
 
 
 # ── Scoring Math ──────────────────────────────────────────────────────────────

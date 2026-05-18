@@ -13,10 +13,19 @@ State-machine UI driven by st.session_state.view:
 """
 import logging
 import os
+import threading
 import streamlit as st
 from datetime import datetime, timezone
 from typing import Optional
 from dotenv import load_dotenv
+
+load_dotenv()
+
+# ── Module-level pipeline lock ────────────────────────────────────────────────
+# Prevents concurrent pipeline runs when Streamlit rerenders the "searching"
+# view while the pipeline is still executing (common with slow Apify/Gemini calls).
+# threading.Lock.acquire(blocking=False) is ATOMIC — no TOCTOU race condition.
+_PIPELINE_LOCK = threading.Lock()
 
 load_dotenv()
 
@@ -890,16 +899,15 @@ def _run_searching():
             _reset()
         return
 
-    # ── Concurrency guard ─────────────────────────────────────────────────────
-    # Streamlit re-renders the entire script on every interaction.
-    # Without this guard, navigating to the "searching" view a second time
-    # (e.g. double-click, tab refresh) would spawn a second parallel pipeline run
-    # — identical Apify actor calls firing concurrently.
-    # We use a module-level flag (not just session_state) so it persists across rerenders.
-    if getattr(_run_searching, "_running", False):
-        st.info("Pipeline is already running — please wait for results.")
+    # ── Atomic concurrency guard ──────────────────────────────────────────────
+    # threading.Lock.acquire(blocking=False) is atomic — if two Streamlit threads
+    # call _run_searching() simultaneously, exactly ONE acquires the lock.
+    # The other returns immediately, showing a "please wait" message.
+    # This eliminates the TOCTOU race in the previous flag-based approach.
+    if not _PIPELINE_LOCK.acquire(blocking=False):
+        st.info("⏳ Pipeline is already running — please wait for results.")
+        st.button("🔄 Refresh status", on_click=lambda: None)
         return
-    _run_searching._running = True
 
     try:
         with st.status("Searching for your opportunities…", expanded=True) as status:
@@ -932,8 +940,8 @@ def _run_searching():
         _goto("confirmed")
 
     finally:
-        # Always release the lock so future pipeline runs are not blocked
-        _run_searching._running = False
+        # Always release lock — even on exception — so future runs are not permanently blocked
+        _PIPELINE_LOCK.release()
 
 
 # ── VIEW: input ───────────────────────────────────────────────────────────────

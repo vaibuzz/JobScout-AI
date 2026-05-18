@@ -22,28 +22,15 @@ log = logging.getLogger(__name__)
 
 def upsert_candidate(profile_data: dict) -> str:
     """
-    Insert a new candidate. Returns candidate_id (UUID).
-    If the same linkedin_url was ingested within 30 days, returns the existing id
-    without re-inserting (30-day cache to avoid redundant Proxycurl credits).
+    Insert a new candidate row. Returns the new candidate_id (UUID).
+
+    NOTE: 30-day URL deduplication cache was removed — it was a holdover from
+    when Proxycurl API credits were being conserved. We no longer use Proxycurl,
+    so every new submission must create a fresh candidate row with its own
+    pipeline run, target roles, and scored matches.
     """
     db = get_client()
     linkedin_url = profile_data.get("linkedin_url")
-
-    if linkedin_url:
-        existing = (
-            db.table("candidates")
-            .select("id, created_at")
-            .eq("linkedin_url", linkedin_url)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        if existing.data:
-            rec = existing.data[0]
-            created = datetime.fromisoformat(rec["created_at"].replace("Z", "+00:00"))
-            if (datetime.now(timezone.utc) - created) < timedelta(days=30):
-                log.info("30-day cache hit for %s — reusing %s", linkedin_url, rec["id"])
-                return rec["id"]
 
     result = (
         db.table("candidates")
