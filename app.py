@@ -884,6 +884,14 @@ def _run_profiling():
     from pipeline.s1_ingest import ingest_profile
     from pipeline.s2_synthesise import synthesise_candidate
 
+    # ── Guard: prevent duplicate profiling runs during Streamlit rerenders ─────
+    # Streamlit re-runs the entire script on every interaction. Without this
+    # guard, the Apify profile scraper fires 5x for the same LinkedIn URL.
+    if st.session_state.get("_is_profiling", False):
+        st.info("⏳ Profile analysis is already running — please wait.")
+        return
+    st.session_state._is_profiling = True
+
     url  = st.session_state._pending_url
     pdf  = st.session_state._pending_pdf
     name = st.session_state._pending_name
@@ -906,17 +914,20 @@ def _run_profiling():
         st.session_state.student_profile = profile
         st.session_state.candidate_model = model
         st.session_state.error_msg       = None
+        st.session_state._is_profiling   = False
         _goto("confirmed")
 
     except Exception as exc:
         log.exception("S1/S2 failed")
         st.session_state.error_msg = str(exc)
+        st.session_state._is_profiling = False
         _goto("input")
 
 
 def _run_searching():
     from pipeline.s3_discover import discover_leads
     from pipeline.s4_rank    import rank_leads
+    from db.queries import get_candidate
 
     cid   = st.session_state.candidate_id
     model = st.session_state.candidate_model
@@ -927,11 +938,16 @@ def _run_searching():
             _reset()
         return
 
-    # ── Atomic concurrency guard ──────────────────────────────────────────────
-    # threading.Lock.acquire(blocking=False) is atomic — if two Streamlit threads
-    # call _run_searching() simultaneously, exactly ONE acquires the lock.
-    # The other returns immediately, showing a "please wait" message.
-    # This eliminates the TOCTOU race in the previous flag-based approach.
+    # ── Layer 1: Supabase-level dedup guard (cross-process) ───────────────────
+    # Checks the DB pipeline_status flag. This works across Streamlit Cloud
+    # workers (multiple Python processes) where threading.Lock is useless.
+    existing = get_candidate(cid)
+    if existing and existing.get("pipeline_status") == "discovering":
+        st.info("⏳ Pipeline is already running for this candidate — please wait.")
+        st.button("🔄 Refresh status", on_click=lambda: None)
+        return
+
+    # ── Layer 2: In-process thread lock (same process safety) ─────────────────
     if not _PIPELINE_LOCK.acquire(blocking=False):
         st.info("⏳ Pipeline is already running — please wait for results.")
         st.button("🔄 Refresh status", on_click=lambda: None)
