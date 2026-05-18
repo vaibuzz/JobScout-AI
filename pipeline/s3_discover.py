@@ -270,30 +270,36 @@ def _run_linkedin_jobs_channel(queries: list[str]) -> list[RawLead]:
     seen_job_ids: set[str] = set()
     leads: list[RawLead] = []
 
-    for url_chunk in chunk_list(urls, 4):
-        try:
-            run = client.actor(_ACTOR_LINKEDIN_JOBS).call(
-                run_input={
-                    "urls":          url_chunk,
-                    "count":         200,   # increased from 100 to 200 per user request
-                    "scrapeCompany": True,  # needed to get company data
-                }
-            )
-            items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
-            log.debug("S3[A1]: Actor returned %d raw items for chunk", len(items))
+    # Send all URLs in a SINGLE actor call.
+    # Stage 2 produces max 3 role titles, so this is always a small list.
+    # Chunking caused duplicate actor runs when the same queries appeared
+    # across multiple pipeline re-renders.
+    if not urls:
+        return leads
 
-            for item in items:
-                job_id = str(item.get("id", ""))
-                if job_id and job_id in seen_job_ids:
-                    continue
-                if job_id:
-                    seen_job_ids.add(job_id)
+    try:
+        run = client.actor(_ACTOR_LINKEDIN_JOBS).call(
+            run_input={
+                "urls":          urls,
+                "count":         200,   # increased from 100 to 200 per user request
+                "scrapeCompany": True,  # needed to get company data
+            }
+        )
+        items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+        log.debug("S3[A1]: Actor returned %d raw items", len(items))
+
+        for item in items:
+            job_id = str(item.get("id", ""))
+            if job_id and job_id in seen_job_ids:
+                continue
+            if job_id:
+                seen_job_ids.add(job_id)
                 lead = _parse_apify_linkedin_job(item)
                 if lead:
                     leads.append(lead)
 
-        except Exception as e:
-            log.error("S3[A1]: Apify LinkedIn Jobs actor failed for chunk: %s", e)
+    except Exception as e:
+        log.error("S3[A1]: Apify LinkedIn Jobs actor failed: %s", e)
 
     return leads
 
@@ -678,78 +684,11 @@ class _ManagerResult(BaseModel):
 
 def _enrich_hiring_managers(leads: list[RawLead]) -> list[RawLead]:
     """
-    For leads without hiring manager data (Wellfound, iimjobs, YC Jobs),
-    search for the company CEO/Founder via Tavily + Gemini and extract their LinkedIn URL.
-
-    The LinkedIn URL is then used by Stage 5 (Apollo) for email lookup.
-    Capped at 20 companies per run to control Tavily usage.
-    Runs in parallel — max 5 concurrent searches.
+    Hiring manager enrichment via Tavily — DISABLED.
+    Tavily is out of credits (432 errors). Returns leads unchanged.
+    LinkedIn Jobs leads already carry hiring manager data from Apify directly.
     """
-    from utils.search import tavily_search
-    from utils.gemini import gemini_json
-
-    candidates = [
-        l for l in leads
-        if not l.hiring_manager_linkedin
-        and l.company_name
-        and l.company_name.lower() not in ("unknown", "")
-    ][:20]
-
-    if not candidates:
-        return leads
-
-    log.info("S3: Enriching hiring manager LinkedIn for %d leads (no contact data)", len(candidates))
-
-    def _lookup(lead: RawLead) -> tuple[RawLead, Optional[str], Optional[str]]:
-        import time
-        # Skip known MNCs — no point cold-emailing Jeff Bezos
-        if _is_mnc(lead.company_name):
-            log.debug("S3: Skipping MNC manager lookup for %s", lead.company_name)
-            return lead, None, None
-        try:
-            with _TAVILY_LOCK:  # global lock — one call at a time across all runs
-                results = tavily_search(
-                    f'"{lead.company_name}" CEO founder LinkedIn startup India',
-                    max_results=3,
-                    days_back=365,
-                )
-                time.sleep(0.8)   # stay under Tavily free-tier rate limit
-            if not results:
-                return lead, None, None
-            combined = " ".join(
-                r.get("url", "") + " " + r.get("content", "")
-                for r in results
-            )[:2000]
-            extracted = gemini_json(
-                prompt=(
-                    f"Company: {lead.company_name}\n"
-                    f"Hiring for: {lead.role_title}\n\n"
-                    f"Search results:\n{combined}"
-                ),
-                system=(
-                    "Extract the CEO or Founder's name and LinkedIn profile URL from the results. "
-                    "Only return a linkedin.com/in/... URL (not company page). "
-                    "Return null for both if not clearly identified."
-                ),
-                schema=_ManagerResult,
-            )
-            return lead, extracted.name, extracted.linkedin_url
-        except Exception as e:
-            log.warning("S3: Manager lookup failed for %s: %s", lead.company_name, e)
-            return lead, None, None
-
-    enriched = 0
-    with ThreadPoolExecutor(max_workers=1) as executor:  # sequential — Tavily rate limit
-        futures = [executor.submit(_lookup, l) for l in candidates]
-        for future in as_completed(futures):
-            lead, name, linkedin_url = future.result()
-            if name:
-                lead.hiring_manager_name    = name
-                enriched += 1
-            if linkedin_url:
-                lead.hiring_manager_linkedin = linkedin_url
-
-    log.info("S3: Hiring manager enrichment — found LinkedIn for %d/%d leads", enriched, len(candidates))
+    log.info("S3: Hiring manager enrichment skipped — Tavily disabled.")
     return leads
 
 
@@ -765,72 +704,12 @@ class _StageExtract(BaseModel):
 
 def _enrich_company_stages(leads: list[RawLead]) -> list[RawLead]:
     """
-    Look up company funding stage for all direct leads via Tavily + Gemini.
-    Runs lookups in parallel (max 5 concurrent) to minimise latency.
-    Updates company_stage_label in-place on each lead.
-    Skips leads that already have a confirmed (non-unknown, non-null) stage.
+    Company stage enrichment via Tavily — DISABLED.
+    Tavily is out of credits (432 errors). Returns leads unchanged.
+    All leads will carry 'unknown' stage label until a new enrichment
+    source (e.g. Crunchbase, static map) is wired in.
     """
-    from utils.search import tavily_search
-    from utils.gemini import gemini_json
-
-    # Only enrich leads without a confirmed stage
-    companies = list({
-        lead.company_name
-        for lead in leads
-        if not lead.company_stage_label or lead.company_stage_label == "unknown"
-    })
-
-    if not companies:
-        return leads
-
-    log.info("S3[A]: Looking up company stages for %d unique companies", len(companies))
-
-    def _lookup_stage(company: str) -> tuple[str, str]:
-        """Return (company_name, stage_label). Fails silently → 'unknown'."""
-        import time
-        # Instantly classify known MNCs without any API call
-        if _is_mnc(company):
-            log.debug("S3: MNC shortcut for %s", company)
-            return company, "mnc"
-        try:
-            with _TAVILY_LOCK:  # global lock — one call at a time across all runs
-                results = tavily_search(
-                    f'"{company}" startup funding stage India investors',
-                    max_results=3,
-                    days_back=365,
-                )
-                time.sleep(0.8)   # stay under Tavily free-tier rate limit
-            if not results:
-                return company, "unknown"
-            combined = " ".join(r.get("content", "") for r in results)[:1500]
-            extracted = gemini_json(
-                prompt=f"Company: {company}\n\nWeb search results:\n{combined}",
-                system=(
-                    "Extract the company's current funding stage from the search results. "
-                    "If it's a large established company (Infosys, TCS, Wipro, etc.), use 'mnc'. "
-                    "If publicly listed, use 'public'. If you cannot determine the stage, use 'unknown'."
-                ),
-                schema=_StageExtract,
-            )
-            return company, extracted.stage_label
-        except Exception as e:
-            log.warning("S3: Stage lookup failed for %s: %s", company, e)
-            return company, "unknown"
-
-    # Run sequentially — Tavily free tier allows ~1 req/sec, parallel calls hit rate limits
-    stage_map: dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        futures = {executor.submit(_lookup_stage, c): c for c in companies}
-        for future in as_completed(futures):
-            company, stage = future.result()
-            stage_map[company] = stage
-            log.debug("S3: %s → %s", company, stage)
-
-    # Apply results to all leads that needed enrichment
-    for lead in leads:
-        if not lead.company_stage_label or lead.company_stage_label == "unknown":
-            lead.company_stage_label = stage_map.get(lead.company_name, "unknown")
-
+    log.info("S3[A]: Stage enrichment skipped — Tavily disabled. %d leads carry 'unknown' stage.", len(leads))
     return leads
 
 

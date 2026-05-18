@@ -890,6 +890,17 @@ def _run_searching():
             _reset()
         return
 
+    # ── Concurrency guard ─────────────────────────────────────────────────────
+    # Streamlit re-renders the entire script on every interaction.
+    # Without this guard, navigating to the "searching" view a second time
+    # (e.g. double-click, tab refresh) would spawn a second parallel pipeline run
+    # — identical Apify actor calls firing concurrently.
+    # We use a module-level flag (not just session_state) so it persists across rerenders.
+    if getattr(_run_searching, "_running", False):
+        st.info("Pipeline is already running — please wait for results.")
+        return
+    _run_searching._running = True
+
     try:
         with st.status("Searching for your opportunities…", expanded=True) as status:
             st.write("**Stage 3** — Searching LinkedIn Jobs, Wellfound & founder posts…")
@@ -919,6 +930,10 @@ def _run_searching():
         st.session_state.error_msg = str(exc)
         st.session_state._is_searching = False
         _goto("confirmed")
+
+    finally:
+        # Always release the lock so future pipeline runs are not blocked
+        _run_searching._running = False
 
 
 # ── VIEW: input ───────────────────────────────────────────────────────────────
