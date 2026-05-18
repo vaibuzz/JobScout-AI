@@ -621,6 +621,7 @@ def _enrich_hiring_managers(leads: list[RawLead]) -> list[RawLead]:
     log.info("S3: Enriching hiring manager LinkedIn for %d leads (no contact data)", len(candidates))
 
     def _lookup(lead: RawLead) -> tuple[RawLead, Optional[str], Optional[str]]:
+        import time
         try:
             results = tavily_search(
                 f'"{lead.company_name}" CEO founder LinkedIn startup India',
@@ -646,13 +647,14 @@ def _enrich_hiring_managers(leads: list[RawLead]) -> list[RawLead]:
                 ),
                 schema=_ManagerResult,
             )
+            time.sleep(0.7)   # stay under Tavily free-tier rate limit (~1 req/sec)
             return lead, extracted.name, extracted.linkedin_url
         except Exception as e:
             log.warning("S3: Manager lookup failed for %s: %s", lead.company_name, e)
             return lead, None, None
 
     enriched = 0
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=1) as executor:  # sequential — Tavily rate limit
         futures = [executor.submit(_lookup, l) for l in candidates]
         for future in as_completed(futures):
             lead, name, linkedin_url = future.result()
@@ -700,6 +702,7 @@ def _enrich_company_stages(leads: list[RawLead]) -> list[RawLead]:
 
     def _lookup_stage(company: str) -> tuple[str, str]:
         """Return (company_name, stage_label). Fails silently → 'unknown'."""
+        import time
         try:
             results = tavily_search(
                 f'"{company}" startup funding stage India investors',
@@ -718,14 +721,15 @@ def _enrich_company_stages(leads: list[RawLead]) -> list[RawLead]:
                 ),
                 schema=_StageExtract,
             )
+            time.sleep(0.7)   # stay under Tavily free-tier rate limit (~1 req/sec)
             return company, extracted.stage_label
         except Exception as e:
             log.warning("S3: Stage lookup failed for %s: %s", company, e)
             return company, "unknown"
 
-    # Run in parallel — max 5 concurrent Tavily calls
+    # Run sequentially — Tavily free tier allows ~1 req/sec, parallel calls hit rate limits
     stage_map: dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=1) as executor:
         futures = {executor.submit(_lookup_stage, c): c for c in companies}
         for future in as_completed(futures):
             company, stage = future.result()
