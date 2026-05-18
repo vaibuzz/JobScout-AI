@@ -99,7 +99,6 @@ def _apify_scrape_profile(linkedin_url: str) -> str | None:
 
         run = client.actor("LpVuK3Zozwuipa5bp").call(
             run_input={
-                "profileScraperMode": "Profile details no email ($4 per 1k)",
                 "queries": [linkedin_url],
             }
         )
