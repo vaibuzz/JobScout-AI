@@ -5,7 +5,7 @@ python-dotenv==1.1.0
 requests==2.32.3
 
 # ── LLM — Gemini (google-genai is the current SDK, NOT google-generativeai) ─
-google-genai==1.16.0           # native Pydantic response_schema + response.parsed
+google-genai==1.17.0           # native Pydantic response_schema + response.parsed
 
 # ── Profile ingestion ────────────────────────────────────────────────────────
 pdfplumber==0.11.6             # PDF text extraction for resume upload
