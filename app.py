@@ -575,6 +575,7 @@ _DEFAULTS: dict = {
     "_pending_pdf":       None,
     "_pending_name":      "",
     "_hist_name":         "Candidate",
+    "_is_searching":      False,
 }
 
 
@@ -661,8 +662,8 @@ def _restore_from_query_params():
             st.session_state.selected_match_id = mid
         st.session_state.draft_type = params.get("dt", "email")
 
-        # Restore profile + candidate_model for confirmed view
-        if view == "confirmed":
+        # Restore profile + candidate_model for confirmed and subsequent views
+        if view in ("confirmed", "searching", "results", "draft", "dossier"):
             profile_data = candidate.get("student_profile")
             if profile_data:
                 try:
@@ -670,13 +671,15 @@ def _restore_from_query_params():
                     st.session_state.student_profile = StudentProfile.model_validate(profile_data)
                 except Exception as e:
                     log.warning("Could not restore StudentProfile: %s", e)
-                    view = "results"
+                    if view == "confirmed":
+                        view = "results"
 
             model = _build_candidate_model_from_db(candidate)
             if model:
                 st.session_state.candidate_model = model
             else:
-                view = "results"
+                if view == "confirmed":
+                    view = "results"
 
         st.session_state.view = view
         log.info("Session restored from URL params: view=%s cid=%s", view, cid)
@@ -908,11 +911,13 @@ def _run_searching():
             for lead in scored
         ]
         st.session_state.error_msg = None
+        st.session_state._is_searching = False
         _goto("results")
 
     except Exception as exc:
         log.exception("S3/S4 failed")
         st.session_state.error_msg = str(exc)
+        st.session_state._is_searching = False
         _goto("confirmed")
 
 
@@ -1151,7 +1156,10 @@ def _view_confirmed():
             st.error(st.session_state.error_msg)
             st.session_state.error_msg = None
 
-        if st.button("🚀  Start Job Search", type="primary", use_container_width=True):
+        is_searching = st.session_state.get("_is_searching", False)
+
+        if st.button("🚀  Start Job Search", type="primary", use_container_width=True, disabled=is_searching):
+            st.session_state._is_searching = True
             _goto("searching")
 
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
