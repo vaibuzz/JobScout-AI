@@ -1,0 +1,34 @@
+# ── Core ────────────────────────────────────────────────────────────────────
+streamlit==1.45.1
+pydantic==2.11.4
+python-dotenv==1.1.0
+requests==2.32.3
+
+# ── LLM — Gemini (google-genai is the current SDK, NOT google-generativeai) ─
+google-genai==1.16.0           # native Pydantic response_schema + response.parsed
+
+# ── Profile ingestion ────────────────────────────────────────────────────────
+pdfplumber==0.11.6             # PDF text extraction for resume upload
+apify-client==2.5.0            # LinkedIn Profile Scraper + Jobs Scraper actors
+
+# ── Job & web search ─────────────────────────────────────────────────────────
+tavily-python==0.5.1           # Open-surface web search (NO Twitter API needed)
+
+# ── Deduplication ────────────────────────────────────────────────────────────
+rapidfuzz==3.13.0              # Fuzzy match for cross-channel lead dedup
+
+# ── Database ─────────────────────────────────────────────────────────────────
+supabase==2.15.2
+
+# ── Email enrichment (raw requests — no official packages needed) ─────────────
+# Apollo.io   → requests to https://api.apollo.io/api/v1/people/match
+# Hunter.io   → requests to https://api.hunter.io/v2/email-finder
+
+# ── PDF export ───────────────────────────────────────────────────────────────
+fpdf2==2.8.3                   # Pure Python PDF — no GTK/Cairo system deps (replaces weasyprint)
+markdown==3.7                  # Markdown → text for dossier formatting
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+pandas==2.2.3
+tenacity==9.1.2                # @retry decorator for all external API calls
+rich==14.0.0                   # Pretty console logging during pipeline runs

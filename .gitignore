@@ -1,0 +1,34 @@
+# Environment
+.env
+.env.local
+
+# Testing assets (profile PDFs — never push to repo)
+testing tools/
+testing_tools/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Dev artifacts
+runs/
+backup/
+*.pdf
+
+# Debug / scratch scripts
+debug_check.py
+diag.py
+chat_history.txt
+chat_history_2.txt
+test_apify_actors.py
+
+# IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/secrets.toml
