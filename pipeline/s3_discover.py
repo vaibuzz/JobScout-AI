@@ -352,7 +352,7 @@ def _run_wellfound_channel(queries: list[str]) -> list[RawLead]:
     urls = [_build_wellfound_url(q) for q in unique_queries]
     leads: list[RawLead] = []
 
-    for url_chunk in chunk_list(urls, 4):
+    for url_chunk in chunk_list(urls, 1):
         try:
             run = client.actor(_ACTOR_WELLFOUND).call(
                 run_input={
