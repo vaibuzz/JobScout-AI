@@ -151,7 +151,19 @@ STEP 3: FILL ALL OTHER FIELDS
 
 - search_queries.formal_platforms: primary role title strings for Apify
   LinkedIn Jobs + Wellfound scrapers. Use PRIMARY title only (NOT aliases).
-  Max 3 strings total.
+  Max 3 strings total. (Legacy field — role_groups is authoritative.)
+
+- search_queries.role_groups: THE PRIMARY SEARCH STRATEGY for LinkedIn Jobs.
+  One entry per target role. Each entry must have:
+    role_title:    The primary job title (e.g. 'Chief of Staff')
+    confidence:    Same confidence as target_roles
+    search_titles: [primary title] + all aliases from target_roles for this role.
+                   E.g. for 'Chief of Staff' with aliases ['Founder\'s Office', 'Head of CEO Office']:
+                   search_titles = ['Chief of Staff', "Founder's Office", 'Head of CEO Office']
+                   Max 4 titles per group. First entry MUST be the primary title.
+    hidden_signals: 1-2 '#Hiring ...' phrases specific to this role group.
+                   Same rules as hidden_signals below. Max 2 per group.
+  Generate exactly as many role_groups as target_roles. Max 3 groups.
 
 - search_queries.hidden_signals: phrases for the LinkedIn Post Search Scraper.
   MUST start with "#Hiring" followed by the role title or a key alias.
@@ -205,6 +217,29 @@ def synthesise_candidate(candidate_id: str, student_profile: StudentProfile) -> 
         len(candidate_model.target_roles),
         candidate_model.x_factor[:60],
     )
+
+    # -- Step 1b: Auto-build role_groups if Gemini didn't generate them ---------
+    # Fallback ensures backward compat: if old prompt/DB data lacks role_groups,
+    # we derive them deterministically from target_roles + aliases.
+    if not candidate_model.search_queries.role_groups:
+        from models.student import RoleGroup
+        derived_groups = []
+        for role in candidate_model.target_roles:
+            search_titles = [role.title] + (role.aliases or [])  # primary first
+            # Use hidden_signals that mention this role
+            role_signals = [
+                s for s in candidate_model.search_queries.hidden_signals
+                if role.title.lower() in s.lower()
+                or any(alias.lower() in s.lower() for alias in (role.aliases or []))
+            ][:2]
+            derived_groups.append(RoleGroup(
+                role_title    = role.title,
+                confidence    = role.confidence,
+                search_titles = search_titles[:4],  # max 4 per group
+                hidden_signals = role_signals,
+            ))
+        candidate_model.search_queries.role_groups = derived_groups
+        log.info("S2: Auto-derived %d role_groups from target_roles", len(derived_groups))
 
     # -- Step 2: Ground compensation with Tavily web search --------------------
     comp_band = _ground_compensation(

@@ -702,7 +702,7 @@ def _build_candidate_model_from_db(candidate: dict):
     try:
         from models.student import (
             CandidateModel, TargetRole, ConfidenceLevel,
-            CompensationBand, SearchQueries,
+            CompensationBand, SearchQueries, RoleGroup,
         )
 
         target_roles = []
@@ -733,9 +733,37 @@ def _build_candidate_model_from_db(candidate: dict):
                 pass
 
         sq_raw = candidate.get("search_queries") or {}
+
+        # Reconstruct role_groups from DB if present; otherwise derive from target_roles
+        role_groups_raw = sq_raw.get("role_groups", [])
+        role_groups = []
+        for rg in role_groups_raw:
+            if isinstance(rg, dict):
+                try:
+                    conf = ConfidenceLevel(rg.get("confidence", "medium"))
+                except ValueError:
+                    conf = ConfidenceLevel.medium
+                role_groups.append(RoleGroup(
+                    role_title    = rg.get("role_title", ""),
+                    confidence    = conf,
+                    search_titles = rg.get("search_titles", []),
+                    hidden_signals = rg.get("hidden_signals", []),
+                ))
+
+        # Fallback: derive role_groups from target_roles (legacy DB rows)
+        if not role_groups and target_roles:
+            for role in target_roles:
+                role_groups.append(RoleGroup(
+                    role_title    = role.title,
+                    confidence    = role.confidence,
+                    search_titles = [role.title] + list(role.aliases or []),
+                    hidden_signals = [],
+                ))
+
         search_queries = SearchQueries(
             formal_platforms = sq_raw.get("formal_platforms", []),
             hidden_signals   = sq_raw.get("hidden_signals",   []),
+            role_groups      = role_groups,
         )
 
         return CandidateModel(

@@ -80,11 +80,35 @@ class TargetRole(BaseModel):
     )
 
 
+class RoleGroup(BaseModel):
+    """
+    A single target role bundled with ALL its search aliases.
+    Stage 3 sends one LinkedIn Jobs actor call per group, covering the primary
+    title + all aliases — better coverage, fewer deduplicated actor calls.
+    """
+    role_title:    str             = Field(description="Primary role title e.g. 'Chief of Staff'")
+    confidence:    ConfidenceLevel = Field(description="Match confidence from target_roles")
+    search_titles: list[str]       = Field(
+        description="All titles to search for this role group. "
+                    "First entry is the primary title; remaining are aliases. "
+                    "E.g. ['Chief of Staff', \"Founder's Office\", 'Head of CEO Office']. "
+                    "Max 4 titles per group.",
+        max_length=4,
+    )
+    hidden_signals: list[str] = Field(
+        default_factory=list,
+        description="#Hiring phrases for this role group (LinkedIn Post Scraper). "
+                    "MUST start with '#Hiring'. Max 2 per group.",
+        max_length=2,
+    )
+
+
 class SearchQueries(BaseModel):
     formal_platforms: list[str] = Field(
         default_factory=list,
         description="Primary job title strings for Apify LinkedIn Jobs + Wellfound Scrapers. "
-                    "Use only the primary role title — NOT aliases. Max 3 strings.",
+                    "Use only the primary role title — NOT aliases. Max 3 strings. "
+                    "(Legacy field — role_groups is the authoritative field for Stage 3.)",
     )
     hidden_signals: list[str] = Field(
         default_factory=list,
@@ -94,6 +118,14 @@ class SearchQueries(BaseModel):
                     "Do NOT use generic titles (e.g. 'Sales Manager') or add location suffixes. "
                     "Max 5 strings.",
     )
+    role_groups: list[RoleGroup] = Field(
+        default_factory=list,
+        description="Role-grouped search strategy. One entry per target role, each containing "
+                    "the primary title + all aliases. Stage 3 sends one LinkedIn actor call per group. "
+                    "Max 3 groups (one per target_role).",
+        max_length=3,
+    )
+
 
 
 class CompensationBand(BaseModel):
