@@ -109,34 +109,80 @@ def discover_leads(
 
     # ── Channel A: Formal job listings ───────────────────────────────────────
     direct_leads: list[RawLead] = []
+    uncached_formal_queries = []
 
-    if formal_queries and APIFY_API_KEY:
-        log.info("S3[A1]: Running Apify LinkedIn Jobs (queries: %d)", len(formal_queries))
-        linkedin_leads = _run_linkedin_jobs_channel(formal_queries)
+    if formal_queries:
+        from db.queries import get_recent_direct_leads_by_role
+        
+        # Deduplicate to avoid checking DB multiple times for same string
+        unique_formal_queries = list(dict.fromkeys(formal_queries))
+
+        for q in unique_formal_queries:
+            cached_rows = get_recent_direct_leads_by_role(q, hours=48)
+            # If we have at least 15 leads from the last 48 hours, use the cache
+            if len(cached_rows) >= 15:
+                log.info("S3[A]: CACHE HIT for '%s' — bypassing scrapers, loaded %d recent leads", q, len(cached_rows))
+                for row in cached_rows:
+                    posted_dt = None
+                    if row.get("posted_at"):
+                        try:
+                            # Safely parse ISO string with or without Z
+                            posted_dt = datetime.fromisoformat(row["posted_at"].replace("Z", "+00:00"))
+                        except Exception:
+                            pass
+
+                    direct_leads.append(RawLead(
+                        company_name=row.get("company_name", ""),
+                        role_title=row.get("role_title", ""),
+                        description=row.get("description", ""),
+                        key_requirements=row.get("key_requirements", []),
+                        location=row.get("location", "India"),
+                        remote_ok=row.get("remote_ok", False),
+                        compensation_estimate=row.get("salary_estimate"),
+                        source_channel="formal",
+                        source_platform=row.get("source_platform", "Cache"),
+                        post_url=row.get("post_url"),
+                        posted_at=posted_dt,
+                        apify_job_id=row.get("apify_job_id"),
+                        hiring_manager_name=row.get("hiring_manager_name"),
+                        hiring_manager_linkedin=row.get("hiring_manager_linkedin"),
+                        company_stage_label=row.get("company_stage_label", "unknown"),
+                    ))
+            else:
+                log.info("S3[A]: CACHE MISS for '%s' — queueing for Apify", q)
+                uncached_formal_queries.append(q)
+
+    if uncached_formal_queries and APIFY_API_KEY:
+        log.info("S3[A1]: Running Apify LinkedIn Jobs (queries: %d)", len(uncached_formal_queries))
+        linkedin_leads = _run_linkedin_jobs_channel(uncached_formal_queries)
         log.info("S3[A1]: LinkedIn → %d raw leads", len(linkedin_leads))
 
-        log.info("S3[A2]: Running Apify Wellfound (queries: %d)", len(formal_queries))
-        wellfound_leads = _run_wellfound_channel(formal_queries)
+        log.info("S3[A2]: Running Apify Wellfound (queries: %d)", len(uncached_formal_queries))
+        wellfound_leads = _run_wellfound_channel(uncached_formal_queries)
         log.info("S3[A2]: Wellfound → %d raw leads", len(wellfound_leads))
 
-        log.info("S3[A3]: Running YC Jobs (queries: %d)", len(formal_queries))
-        yc_leads = _run_yc_jobs_channel(formal_queries)
+        log.info("S3[A3]: Running YC Jobs (queries: %d)", len(uncached_formal_queries))
+        yc_leads = _run_yc_jobs_channel(uncached_formal_queries)
         log.info("S3[A3]: YC Jobs → %d raw leads", len(yc_leads))
 
-        log.info("S3[A4]: Running Cutshort.io (queries: %d)", len(formal_queries))
-        cutshort_leads = _run_cutshort_channel(formal_queries)
+        log.info("S3[A4]: Running Cutshort.io (queries: %d)", len(uncached_formal_queries))
+        cutshort_leads = _run_cutshort_channel(uncached_formal_queries)
         log.info("S3[A4]: Cutshort → %d raw leads", len(cutshort_leads))
 
-        direct_leads = linkedin_leads + wellfound_leads + yc_leads + cutshort_leads
+        new_direct_leads = linkedin_leads + wellfound_leads + yc_leads + cutshort_leads
 
-        # Enrich company stage + hiring manager LinkedIn for all direct leads
-        if direct_leads:
-            log.info("S3[A]: Enriching company stages for %d direct leads", len(direct_leads))
-            direct_leads = _enrich_company_stages(direct_leads)
+        # Enrich company stage + hiring manager LinkedIn for newly scraped direct leads
+        if new_direct_leads:
+            log.info("S3[A]: Enriching company stages for %d new direct leads", len(new_direct_leads))
+            new_direct_leads = _enrich_company_stages(new_direct_leads)
             log.info("S3[A]: Enriching hiring manager LinkedIn for leads without contact data")
-            direct_leads = _enrich_hiring_managers(direct_leads)
+            new_direct_leads = _enrich_hiring_managers(new_direct_leads)
+            
+        direct_leads.extend(new_direct_leads)
+    elif not APIFY_API_KEY:
+        log.warning("S3[A]: Skipping Apify formal channels — APIFY_API_KEY not set")
     else:
-        log.warning("S3[A]: Skipping Apify formal channels — APIFY_API_KEY not set or no queries")
+        log.info("S3[A]: All formal queries were cached. Skipping Apify.")
 
     # ── Channel B: LinkedIn Post Scraper (hidden signals) ────────────────────
     indirect_leads: list[RawLead] = []
@@ -207,7 +253,8 @@ def _build_wellfound_url(role_title: str, country: str = "india") -> str:
 
 def _run_linkedin_jobs_channel(queries: list[str]) -> list[RawLead]:
     """
-    Run Apify LinkedIn Jobs Scraper with all queries in ONE actor call.
+    Run Apify LinkedIn Jobs Scraper.
+    Queries are deduplicated and chunked into sets of max 4 URLs per actor call.
     Each query becomes a LinkedIn search URL. Returns hiring manager data.
     """
     try:
@@ -217,35 +264,36 @@ def _run_linkedin_jobs_channel(queries: list[str]) -> list[RawLead]:
         log.error("S3[A1]: apify-client not installed")
         return []
 
-    urls = [_build_linkedin_jobs_url(q) for q in queries]
+    from utils.helpers import chunk_list
+    unique_queries = list(dict.fromkeys(queries))
+    urls = [_build_linkedin_jobs_url(q) for q in unique_queries]
     seen_job_ids: set[str] = set()
     leads: list[RawLead] = []
 
-    try:
-        run = client.actor(_ACTOR_LINKEDIN_JOBS).call(
-            run_input={
-                "urls":          urls,
-                "count":         100,   # total results across all URLs
-                "scrapeCompany": True,  # needed to get company data
-                # India filtering is handled via location=India in the URL itself.
-                # splitByLocation requires count >= 1100 and is not needed here.
-            }
-        )
-        items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
-        log.debug("S3[A1]: Actor returned %d raw items", len(items))
+    for url_chunk in chunk_list(urls, 4):
+        try:
+            run = client.actor(_ACTOR_LINKEDIN_JOBS).call(
+                run_input={
+                    "urls":          url_chunk,
+                    "count":         200,   # increased from 100 to 200 per user request
+                    "scrapeCompany": True,  # needed to get company data
+                }
+            )
+            items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+            log.debug("S3[A1]: Actor returned %d raw items for chunk", len(items))
 
-        for item in items:
-            job_id = str(item.get("id", ""))
-            if job_id and job_id in seen_job_ids:
-                continue
-            if job_id:
-                seen_job_ids.add(job_id)
-            lead = _parse_apify_linkedin_job(item)
-            if lead:
-                leads.append(lead)
+            for item in items:
+                job_id = str(item.get("id", ""))
+                if job_id and job_id in seen_job_ids:
+                    continue
+                if job_id:
+                    seen_job_ids.add(job_id)
+                lead = _parse_apify_linkedin_job(item)
+                if lead:
+                    leads.append(lead)
 
-    except Exception as e:
-        log.error("S3[A1]: Apify LinkedIn Jobs actor failed: %s", e)
+        except Exception as e:
+            log.error("S3[A1]: Apify LinkedIn Jobs actor failed for chunk: %s", e)
 
     return leads
 
@@ -287,8 +335,9 @@ def _parse_apify_linkedin_job(item: dict) -> Optional[RawLead]:
 
 def _run_wellfound_channel(queries: list[str]) -> list[RawLead]:
     """
-    Run Apify Wellfound Scraper (clearpath/wellfound-api-ppe) with all queries
-    in ONE actor call. Each query becomes a Wellfound role URL.
+    Run Apify Wellfound Scraper (clearpath/wellfound-api-ppe).
+    Queries are deduplicated and chunked into sets of max 4 URLs per actor call.
+    Each query becomes a Wellfound role URL.
     Returns full description + salary. No hiring contact from Wellfound.
     """
     try:
@@ -298,28 +347,31 @@ def _run_wellfound_channel(queries: list[str]) -> list[RawLead]:
         log.error("S3[A2]: apify-client not installed")
         return []
 
-    urls = [_build_wellfound_url(q) for q in queries]
+    from utils.helpers import chunk_list
+    unique_queries = list(dict.fromkeys(queries))
+    urls = [_build_wellfound_url(q) for q in unique_queries]
     leads: list[RawLead] = []
 
-    try:
-        run = client.actor(_ACTOR_WELLFOUND).call(
-            run_input={
-                "urls":           urls,
-                "pageLimit":      3,
-                "onlyRemoteJobs": False,
-                "sortBy":         "LAST_POSTED",
-            }
-        )
-        items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
-        log.debug("S3[A2]: Wellfound actor returned %d raw items", len(items))
+    for url_chunk in chunk_list(urls, 4):
+        try:
+            run = client.actor(_ACTOR_WELLFOUND).call(
+                run_input={
+                    "urls":           url_chunk,
+                    "pageLimit":      3,
+                    "onlyRemoteJobs": False,
+                    "sortBy":         "LAST_POSTED",
+                }
+            )
+            items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+            log.debug("S3[A2]: Wellfound actor returned %d raw items for chunk", len(items))
 
-        for item in items:
-            lead = _parse_apify_wellfound_job(item, queries)
-            if lead:
-                leads.append(lead)
+            for item in items:
+                lead = _parse_apify_wellfound_job(item, unique_queries)
+                if lead:
+                    leads.append(lead)
 
-    except Exception as e:
-        log.error("S3[A2]: Apify Wellfound actor failed: %s", e)
+        except Exception as e:
+            log.error("S3[A2]: Apify Wellfound actor failed for chunk: %s", e)
 
     return leads
 

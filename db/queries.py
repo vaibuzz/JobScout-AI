@@ -195,6 +195,23 @@ def get_direct_leads_for_candidate(candidate_id: str) -> list[dict]:
     return [row["direct_leads"] for row in result.data if row.get("direct_leads")]
 
 
+def get_recent_direct_leads_by_role(role_title: str, hours: int = 48) -> list[dict]:
+    """
+    Fetch direct leads scraped recently for a specific role title.
+    Used to cache discovery and avoid redundant Apify API calls.
+    """
+    db = get_client()
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    result = (
+        db.table("direct_leads")
+        .select("*")
+        .eq("role_title", role_title)
+        .gte("created_at", cutoff.isoformat())
+        .execute()
+    )
+    return result.data or []
+
+
 # ── Indirect Leads ────────────────────────────────────────────────────────────
 
 def upsert_indirect_lead(lead: dict) -> str:
