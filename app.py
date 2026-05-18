@@ -888,7 +888,7 @@ def _run_profiling():
     # Streamlit re-runs the entire script on every interaction. Without this
     # guard, the Apify profile scraper fires 5x for the same LinkedIn URL.
     if st.session_state.get("_is_profiling", False):
-        st.info("⏳ Profile analysis is already running — please wait.")
+        st.warning("⏳ Profile analysis is already running — please wait.")
         return
     st.session_state._is_profiling = True
 
