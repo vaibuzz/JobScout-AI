@@ -182,6 +182,8 @@ def discover_leads(
     if all_hidden:
         tasks.append(("LinkedIn Indirect", _run_apify_post_scraper_channel, (all_hidden,)))
 
+    # YC Jobs -- one call covering all role titles
+    all_primary = [g.get("role_title") for g in groups if g.get("role_title")]
     # YC Jobs (Cutshort removed — Tavily is permanently dead, 432 errors)
     if all_primary:
         tasks.append(("YC Jobs", _run_yc_jobs_channel, (all_primary,)))
