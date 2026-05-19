@@ -447,3 +447,94 @@ def update_match_dossier(match_id: str, markdown: str):
         "dossier_markdown":     markdown,
         "dossier_generated_at": "now()",
     }).eq("id", match_id).execute()
+
+
+# ── Bulk Inserts ──────────────────────────────────────────────────────────────
+
+def upsert_direct_leads_bulk(leads: list[dict]) -> list[str]:
+    if not leads: return []
+    db = get_client()
+    payload = []
+    for lead in leads:
+        payload.append({
+            "company_name":            lead.get("company_name", "Unknown"),
+            "role_title":              lead.get("role_title", "Unknown Role"),
+            "description":             lead.get("description", "")[:2000],
+            "key_requirements":        lead.get("key_requirements", []),
+            "location":                lead.get("location", "India"),
+            "remote_ok":               lead.get("remote_ok", False),
+            "salary_estimate":         lead.get("salary_estimate") or lead.get("compensation_estimate"),
+            "salary_lpa_parsed":       lead.get("salary_lpa_parsed"),
+            "source_platform":         lead.get("source_platform", "LinkedIn Jobs"),
+            "post_url":                lead.get("post_url"),
+            "posted_at":               lead.get("posted_at"),
+            "apify_job_id":            lead.get("apify_job_id"),
+            "company_stage_label":     _safe_stage(lead.get("company_stage_label")),
+            "hiring_manager_name":     lead.get("hiring_manager_name"),
+            "hiring_manager_linkedin": lead.get("hiring_manager_linkedin"),
+        })
+    
+    # Dedup by the unique constraint: company_name + role_title + source_platform
+    unique_payload = {}
+    for p in payload:
+        k = (p["company_name"], p["role_title"], p["source_platform"])
+        unique_payload[k] = p
+        
+    result = db.table("direct_leads").upsert(
+        list(unique_payload.values()), on_conflict="company_name,role_title,source_platform"
+    ).execute()
+    return [row["id"] for row in result.data]
+
+
+def upsert_indirect_leads_bulk(leads: list[dict]) -> list[str]:
+    if not leads: return []
+    db = get_client()
+    payload = []
+    for lead in leads:
+        payload.append({
+            "company_name":            lead.get("company_name", "Unknown"),
+            "role_title":              lead.get("role_title", "Unknown Role"),
+            "snippet":                 lead.get("snippet", lead.get("description", ""))[:2000],
+            "signal_url":              lead.get("signal_url", lead.get("post_url", "")),
+            "platform":                lead.get("platform", "LinkedIn Post"),
+            "posted_at":               lead.get("posted_at"),
+            "hiring_manager_name":     lead.get("hiring_manager_name"),
+            "hiring_manager_linkedin": lead.get("hiring_manager_linkedin"),
+            "engagement_score":        lead.get("engagement_score"),
+            "role_inferred":           lead.get("role_inferred", False),
+            "extraction_confidence":   lead.get("extraction_confidence", "medium"),
+        })
+        
+    # Dedup by signal_url
+    unique_payload = {p["signal_url"]: p for p in payload if p["signal_url"]}
+    if not unique_payload: return []
+    
+    result = db.table("indirect_leads").upsert(
+        list(unique_payload.values()), on_conflict="signal_url"
+    ).execute()
+    return [row["id"] for row in result.data]
+
+
+def create_matches_direct_bulk(candidate_id: str, lead_ids: list[str]):
+    if not lead_ids: return
+    db = get_client()
+    payload = [
+        {"candidate_id": candidate_id, "direct_lead_id": lid, "source_type": "direct"}
+        for lid in lead_ids
+    ]
+    db.table("matches").upsert(
+        payload, on_conflict="candidate_id,direct_lead_id"
+    ).execute()
+
+
+def create_matches_indirect_bulk(candidate_id: str, lead_ids: list[str]):
+    if not lead_ids: return
+    db = get_client()
+    payload = [
+        {"candidate_id": candidate_id, "indirect_lead_id": lid, "source_type": "indirect"}
+        for lid in lead_ids
+    ]
+    db.table("matches").upsert(
+        payload, on_conflict="candidate_id,indirect_lead_id"
+    ).execute()
+

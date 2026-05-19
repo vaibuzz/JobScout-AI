@@ -964,48 +964,49 @@ def _persist_leads(
     Write direct leads to direct_leads table and indirect leads to indirect_leads table.
     Creates placeholder match records for Stage 4 to score.
     Layer 3 dedup: upsert on_conflict prevents duplicate rows.
+    Now uses bulk inserts to dramatically reduce network latency.
     """
     from db.queries import (
-        upsert_direct_lead,
-        upsert_indirect_lead,
-        create_match_direct,
-        create_match_indirect,
+        upsert_direct_leads_bulk,
+        upsert_indirect_leads_bulk,
+        create_matches_direct_bulk,
+        create_matches_indirect_bulk,
     )
 
-    for lead in direct_leads:
-        try:
-            # mode='json' converts datetime objects to ISO strings — required for Supabase
-            lead_id = upsert_direct_lead(lead.model_dump(mode='json'))
-            lead.job_id = lead_id
-            create_match_direct(candidate_id, lead_id)
-        except Exception as e:
-            import traceback
-            log.error("S3: Failed to persist direct lead '%s @ %s': %s\n%s",
-                      lead.role_title, lead.company_name, e, traceback.format_exc())
+    try:
+        log.info("S3: Bulk inserting %d direct leads...", len(direct_leads))
+        direct_payloads = [lead.model_dump(mode='json') for lead in direct_leads]
+        direct_ids = upsert_direct_leads_bulk(direct_payloads)
+        create_matches_direct_bulk(candidate_id, direct_ids)
+        log.info("S3: Successfully bulk inserted %d direct leads", len(direct_ids))
+    except Exception as e:
+        import traceback
+        log.error("S3: Failed to bulk persist direct leads: %s\n%s", e, traceback.format_exc())
 
-    for lead in indirect_leads:
-        # Skip indirect leads with no URL — signal_url is the dedup key,
-        # empty string would collapse all URL-less leads into one row
-        if not lead.post_url:
-            log.warning("S3: Skipping indirect lead '%s @ %s' — no post_url for dedup",
-                        lead.role_title, lead.company_name)
-            continue
-        try:
-            indirect_data = {
-                **lead.model_dump(mode='json'),  # datetime → ISO string
-                "signal_url":             lead.post_url,
-                "snippet":                lead.description,
-                "engagement_score":       lead.__dict__.get("_engagement_score", 0),
-                "role_inferred":          lead.__dict__.get("_role_inferred", False),
-                "extraction_confidence":  lead.__dict__.get("_extraction_confidence", "medium"),
-            }
-            lead_id = upsert_indirect_lead(indirect_data)
-            lead.job_id = lead_id
-            create_match_indirect(candidate_id, lead_id)
-        except Exception as e:
-            import traceback
-            log.error("S3: Failed to persist indirect lead '%s @ %s': %s\n%s",
-                      lead.role_title, lead.company_name, e, traceback.format_exc())
+    try:
+        log.info("S3: Bulk inserting %d indirect leads...", len(indirect_leads))
+        indirect_payloads = []
+        for lead in indirect_leads:
+            if not lead.post_url:
+                log.warning("S3: Skipping indirect lead '%s @ %s' — no post_url for dedup",
+                            lead.role_title, lead.company_name)
+                continue
+            
+            data = lead.model_dump(mode='json')
+            data["signal_url"] = lead.post_url
+            data["snippet"] = lead.description
+            data["engagement_score"] = getattr(lead, "_engagement_score", 0)
+            data["role_inferred"] = getattr(lead, "_role_inferred", False)
+            data["extraction_confidence"] = getattr(lead, "_extraction_confidence", "medium")
+            indirect_payloads.append(data)
+
+        if indirect_payloads:
+            indirect_ids = upsert_indirect_leads_bulk(indirect_payloads)
+            create_matches_indirect_bulk(candidate_id, indirect_ids)
+            log.info("S3: Successfully bulk inserted %d indirect leads", len(indirect_ids))
+    except Exception as e:
+        import traceback
+        log.error("S3: Failed to bulk persist indirect leads: %s\n%s", e, traceback.format_exc())
 
 
 # ── Helper utilities ──────────────────────────────────────────────────────────
