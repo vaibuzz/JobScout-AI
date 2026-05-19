@@ -163,15 +163,16 @@ def discover_leads(
             (search_titles, title),
         ))
 
-    # Wellfound — SINGLE actor call (free-tier redirects all role URLs
-    # to /location/india anyway, so multiple calls waste CUs)
-    all_primary = [g.get("role_title") for g in groups if g.get("role_title")]
-    if all_primary:
-        tasks.append((
-            "Wellfound [all roles]",
-            _run_wellfound_channel,
-            ([all_primary[0]],),  # One URL — all redirect to same page
-        ))
+    # Wellfound — ONE actor call PER role_title (exact title, not aliases)
+    # Each role title gets its own Wellfound search URL so we cover all job types.
+    for g in groups:
+        title = g.get("role_title", "")
+        if title:
+            tasks.append((
+                f"Wellfound [{title}]",
+                _run_wellfound_channel,
+                ([title],),   # one URL built from the exact role_title
+            ))
 
     # LinkedIn Indirect — all hidden_signals in one call
     all_hidden = list(hidden_queries)
@@ -246,51 +247,46 @@ def discover_leads(
     indirect_leads = _dedup_within(indirect_leads)
     direct_leads, indirect_leads = _dedup_cross_channel(direct_leads, indirect_leads)
 
-    # ── Pre-score and sort direct leads BEFORE capping ──────────────────────────
-    # This ensures the cap keeps the BEST leads, not just the first N.
-    # Uses the same Phase 1A Python filter from s4_rank so the logic is
-    # consistent — MNCs, dealbreakers, and low-salary leads are ranked last
-    # and naturally fall outside the cap.
-    if len(direct_leads) > MAX_RAW_LEADS and candidate_model is not None:
+
+    # ── Pre-score and sort direct leads (best-first ordering) ────────────────
+    # No hard cap — ALL scraped leads go to the DB.
+    # Pre-scoring keeps the highest-quality leads ordered first so Stage 4
+    # sees the best candidates when it fetches from the matches table.
+    if direct_leads and candidate_model is not None:
         try:
             from pipeline.s4_rank import _score_direct_initial
             scored_pairs = []
             for lead in direct_leads:
-                # Build a minimal match-dict that _score_direct_initial can read
                 match_dict = {
-                    "role_title":           lead.role_title,
-                    "company_name":         lead.company_name,
-                    "company_stage_label":  lead.company_stage_label,
-                    "description":          lead.description,
+                    "role_title":            lead.role_title,
+                    "company_name":          lead.company_name,
+                    "company_stage_label":   lead.company_stage_label,
+                    "description":           lead.description,
                     "compensation_estimate": lead.compensation_estimate,
-                    "posted_at":            lead.posted_at,
+                    "posted_at":             lead.posted_at,
                 }
                 prescore, _ = _score_direct_initial(match_dict, candidate_model)
                 scored_pairs.append((prescore, lead))
-            # Sort descending — best leads first, MNC/dealbreaker kills (0.0) last
             scored_pairs.sort(key=lambda x: x[0], reverse=True)
             direct_leads = [lead for _, lead in scored_pairs]
             log.info(
-                "S3: Pre-scored %d direct leads — top: %.2f | bottom: %.2f — cap will keep top %d",
+                "S3: Pre-scored %d direct leads — top: %.2f | bottom: %.2f — ALL going to DB",
                 len(direct_leads),
                 scored_pairs[0][0] if scored_pairs else 0,
                 scored_pairs[-1][0] if scored_pairs else 0,
-                MAX_RAW_LEADS,
             )
         except Exception as e:
-            log.warning("S3: Pre-scoring failed (%s) — falling back to position-based cap", e)
+            log.warning("S3: Pre-scoring failed (%s) — leads kept in scrape order", e)
 
-    # Cap: keep best MAX_RAW_LEADS direct + MAX_RAW_LEADS//2 indirect
-    direct_leads   = direct_leads[:MAX_RAW_LEADS]
-    indirect_leads = indirect_leads[:MAX_RAW_LEADS // 2]
-
-    log.info("S3: Final — %d direct + %d indirect leads ready for Stage 4",
+    log.info("S3: Final — %d direct + %d indirect leads — ALL being persisted to DB",
              len(direct_leads), len(indirect_leads))
 
     _persist_leads(candidate_id, direct_leads, indirect_leads)
     update_candidate_status(candidate_id, "discovered")
 
     return direct_leads, indirect_leads
+
+
 
 
 # ── URL builders ──────────────────────────────────────────────────────────────
