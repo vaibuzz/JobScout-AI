@@ -115,11 +115,15 @@ def discover_leads(
 
     # ── Supabase-level dedup guard ────────────────────────────────────────────
     # Prevents duplicate pipeline runs across Streamlit Cloud workers.
-    # threading.Lock only works within a single Python process.
+    # Covers ALL in-progress statuses so the gap between 'discovering' → 
+    # 'discovered' → 'ranking' cannot be exploited by a rerender.
     existing = get_candidate(candidate_id)
-    if existing and existing.get("pipeline_status") == "discovering":
-        log.warning("S3: BLOCKED — candidate %s already has status 'discovering'. "
-                    "Skipping duplicate run.", candidate_id)
+    current_status = existing.get("pipeline_status") if existing else None
+    if current_status in ("discovering", "discovered", "ranking"):
+        log.warning(
+            "S3: BLOCKED — candidate %s already has status '%s'. Skipping duplicate run.",
+            candidate_id, current_status,
+        )
         return [], []
 
     update_candidate_status(candidate_id, "discovering")

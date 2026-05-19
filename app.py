@@ -585,6 +585,7 @@ _DEFAULTS: dict = {
     "_pending_name":      "",
     "_hist_name":         "Candidate",
     "_is_searching":      False,
+    "_searching_cid":     None,
 }
 
 
@@ -983,20 +984,26 @@ def _run_searching():
         st.rerun()
         return
 
-    # ── Layer 2: session_state guard — same-process safety within one session ──
-    # Prevents double-fire within the same Streamlit worker process.
-    if st.session_state.get("_is_searching", False):
-        st.warning("⏳ Pipeline is already running — please wait.")
+    # ── Layer 0: Candidate-scoped session guard (fastest check — no DB hit) ────────
+    # If THIS session already started the pipeline for THIS candidate, block
+    # immediately. This catches rerenders that slip between DB status transitions.
+    if st.session_state.get("_searching_cid") == cid:
+        st.warning("⏳ Pipeline already started for this candidate — please wait.")
         time.sleep(3)
         st.rerun()
         return
 
-    # ── Layer 2: In-process thread lock (same process safety) ─────────────────
+    # ── Layer 3: In-process thread lock (last line of defence) ───────────────
     if not _PIPELINE_LOCK.acquire(blocking=False):
         st.warning("⏳ Pipeline is already running — please wait for results.")
         time.sleep(3)
         st.rerun()
         return
+
+    # ── Stamp session state BEFORE launching actors ────────────────────────────
+    # Any rerender from this point on will be caught by Layer 0 above.
+    st.session_state._is_searching  = True
+    st.session_state._searching_cid = cid
 
     try:
         with st.status("Searching for your opportunities…", expanded=True) as status:
@@ -1028,14 +1035,16 @@ def _run_searching():
             {**lead.model_dump(), "job_id": lead.job_id}
             for lead in scored
         ]
-        st.session_state.error_msg = None
-        st.session_state._is_searching = False
+        st.session_state.error_msg   = None
+        st.session_state._is_searching  = False
+        st.session_state._searching_cid = None   # clear so a fresh run is allowed later
         _goto("results")
 
     except Exception as exc:
         log.exception("S3/S4 failed")
-        st.session_state.error_msg = str(exc)
-        st.session_state._is_searching = False
+        st.session_state.error_msg      = str(exc)
+        st.session_state._is_searching  = False
+        st.session_state._searching_cid = None   # clear on failure so user can retry
         _goto("confirmed")
 
     finally:
