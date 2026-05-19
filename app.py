@@ -901,21 +901,33 @@ def _run_profiling():
     from pipeline.s1_ingest import ingest_profile
     from pipeline.s2_synthesise import synthesise_candidate
 
-    # ── Guard: prevent duplicate profiling runs during Streamlit rerenders ─────
-    # Streamlit re-runs the entire script on every interaction. Without this
-    # guard, the Apify profile scraper fires 5x for the same LinkedIn URL.
-    if st.session_state.get("_is_profiling", False):
-        st.warning("⏳ Profile analysis is already running — please wait.")
-        return
-    st.session_state._is_profiling = True
-
     url  = st.session_state._pending_url
     pdf  = st.session_state._pending_pdf
     name = st.session_state._pending_name
 
+    # ── Guard 1: already complete in this session — go straight to confirmed ───
+    # If profiling already ran successfully (candidate_model is set), skip
+    # directly to confirmed page instead of re-running the entire pipeline.
+    if (
+        st.session_state.get("candidate_model") is not None
+        and st.session_state.get("candidate_id") is not None
+    ):
+        _goto("confirmed")
+        return
+
+    # ── Guard 2: thread lock — prevents duplicate Apify actor fires ───────────
+    # Uses the same _PIPELINE_LOCK as Stage 3/4.  acquire(blocking=False) means:
+    # if another thread already holds the lock, we poll and wait — but we do NOT
+    # show a static warning and return (which caused the infinite stuck state).
+    if not _PIPELINE_LOCK.acquire(blocking=False):
+        st.info("🔍 **Step 1/2 — Scraping LinkedIn profile...** Apify actor is running.")
+        import time; time.sleep(4)
+        st.rerun()
+        return
+
     try:
         with st.status("Analysing your profile…", expanded=True) as status:
-            st.write("**Stage 1** — Extracting and normalising profile data…")
+            st.write("**Stage 1** — Scraping and normalising your LinkedIn profile…")
             profile, cid = ingest_profile(
                 linkedin_url = url or None,
                 pdf_bytes    = pdf or None,
@@ -931,14 +943,21 @@ def _run_profiling():
         st.session_state.student_profile = profile
         st.session_state.candidate_model = model
         st.session_state.error_msg       = None
-        st.session_state._is_profiling   = False
         _goto("confirmed")
 
     except Exception as exc:
         log.exception("S1/S2 failed")
         st.session_state.error_msg = str(exc)
-        st.session_state._is_profiling = False
         _goto("input")
+
+    finally:
+        # Always release the lock so a fresh run is allowed next time
+        try:
+            _PIPELINE_LOCK.release()
+        except RuntimeError:
+            pass  # Lock was not acquired — safe to ignore
+
+
 
 
 def _run_searching():
