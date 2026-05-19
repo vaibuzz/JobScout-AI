@@ -54,6 +54,13 @@ log = logging.getLogger(__name__)
 APIFY_API_KEY  = os.getenv("APIFY_API_KEY", "")
 MAX_RAW_LEADS  = int(os.getenv("MAX_RAW_LEADS", "50"))
 
+# If at least this many raw jobs are collected across all channels, proceed to
+# ranking even if some channels are still failing or slow.
+PARTIAL_RESULT_THRESHOLD = int(os.getenv("PARTIAL_RESULT_THRESHOLD", "250"))
+
+# Set by discover_leads() — app.py reads this to show a partial-success banner.
+discovery_partial: bool = False
+
 # Apify actor IDs
 _ACTOR_LINKEDIN_JOBS  = "hKByXkMQaC5Qt9UMN"
 _ACTOR_WELLFOUND      = "sqkHGNG0toRTR3ORV"   # clearpath/wellfound-api-ppe
@@ -176,6 +183,10 @@ def discover_leads(
     # Execute all tasks in parallel
     direct_leads:   list[RawLead] = []
     indirect_leads: list[RawLead] = []
+    failed_channels: list[str]    = []
+
+    global discovery_partial
+    discovery_partial = False
 
     log.info("S3: Launching %d parallel scrape tasks simultaneously", len(tasks))
     with ThreadPoolExecutor(max_workers=max(len(tasks), 1)) as executor:
@@ -187,13 +198,39 @@ def discover_leads(
             label = future_map[future]
             try:
                 results: list[RawLead] = future.result()
-                log.info("S3: ✅ %-45s → %d leads", label, len(results))
                 if "Indirect" in label:
                     indirect_leads.extend(results)
                 else:
                     direct_leads.extend(results)
+                total_so_far = len(direct_leads) + len(indirect_leads)
+                log.info("S3: ✅ %-45s → %d leads  (running total: %d)",
+                         label, len(results), total_so_far)
             except Exception as exc:
-                log.error("S3: ❌ %-45s → FAILED: %s", label, exc)
+                total_so_far = len(direct_leads) + len(indirect_leads)
+                failed_channels.append(label)
+                if total_so_far >= PARTIAL_RESULT_THRESHOLD:
+                    # We already have enough — demote failure to a warning
+                    log.warning(
+                        "S3: ⚠ %-45s → FAILED (ignored — %d leads already collected): %s",
+                        label, total_so_far, exc,
+                    )
+                else:
+                    log.error("S3: ❌ %-45s → FAILED: %s", label, exc)
+
+    total_raw = len(direct_leads) + len(indirect_leads)
+
+    if failed_channels and total_raw >= PARTIAL_RESULT_THRESHOLD:
+        discovery_partial = True
+        log.warning(
+            "S3: Partial result mode — %d leads collected, %d channel(s) failed: %s",
+            total_raw, len(failed_channels), failed_channels,
+        )
+    elif failed_channels:
+        log.warning(
+            "S3: %d channel(s) failed and only %d leads collected (below threshold %d). "
+            "Proceeding anyway.",
+            len(failed_channels), total_raw, PARTIAL_RESULT_THRESHOLD,
+        )
 
     # Enrich + dedup + cap
     if direct_leads:

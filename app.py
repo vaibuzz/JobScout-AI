@@ -1002,10 +1002,20 @@ def _run_searching():
         with st.status("Searching for your opportunities…", expanded=True) as status:
             st.write("**Stage 3** — Searching LinkedIn Jobs, Wellfound & founder posts…")
             direct, indirect = discover_leads(cid, model.search_queries.model_dump())
-            st.write(
-                f"✅ Found **{len(direct)}** formal listings + "
-                f"**{len(indirect)}** founder signals"
-            )
+
+            # Check if we entered partial-result mode (some channels failed but
+            # we had enough leads to proceed — surface this to the user)
+            from pipeline.s3_discover import discovery_partial
+            if discovery_partial:
+                st.warning(
+                    f"⚠ Some scrape channels failed — ranking with "
+                    f"**{len(direct) + len(indirect)}** leads collected so far."
+                )
+            else:
+                st.write(
+                    f"✅ Found **{len(direct)}** formal listings + "
+                    f"**{len(indirect)}** founder signals"
+                )
             st.write("**Stage 4** — Scoring and ranking all leads with AI…")
             scored = rank_leads(cid, model)
             st.write(
