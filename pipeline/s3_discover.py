@@ -119,7 +119,7 @@ def discover_leads(
     # 'discovered' → 'ranking' cannot be exploited by a rerender.
     existing = get_candidate(candidate_id)
     current_status = existing.get("pipeline_status") if existing else None
-    if current_status in ("discovering", "discovered", "ranking"):
+    if current_status in ("discovering", "discovered", "ranking", "ranked"):
         log.warning(
             "S3: BLOCKED — candidate %s already has status '%s'. Skipping duplicate run.",
             candidate_id, current_status,

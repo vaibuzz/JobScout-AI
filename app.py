@@ -1010,6 +1010,32 @@ def _run_searching():
             st.write("**Stage 3** — Searching LinkedIn Jobs, Wellfound & founder posts…")
             direct, indirect = discover_leads(cid, model.search_queries.model_dump())
 
+            # ── Safety valve: discover_leads may have been blocked by the DB guard ──
+            # (e.g. status was already 'ranked' from a prior run). In that case,
+            # skip rank_leads and load the already-scored results from the DB.
+            if not direct and not indirect:
+                from db.queries import get_candidate as _gc, get_matches_for_candidate as _gm
+                _cand = _gc(cid)
+                _status = _cand.get("pipeline_status") if _cand else None
+                if _status == "ranked":
+                    st.success("✅ Pipeline already complete — loading your results!")
+                    matches = _gm(cid)
+                    st.session_state.scored_leads = [
+                        {**m, "job_id": m.get("job_id")} for m in matches
+                    ]
+                    st.session_state.error_msg       = None
+                    st.session_state._is_searching   = False
+                    st.session_state._searching_cid  = None
+                    _goto("results")
+                    return
+                elif _status in ("discovering", "discovered", "ranking"):
+                    st.warning("⏳ Discovery still running — checking again in 5 seconds…")
+                    import time; time.sleep(5)
+                    st.rerun()
+                    return
+                # Otherwise 0 leads scraped — fall through to rank_leads(cid) which
+                # will return [] and show the empty results page gracefully.
+
             # Check if we entered partial-result mode (some channels failed but
             # we had enough leads to proceed — surface this to the user)
             from pipeline.s3_discover import discovery_partial
