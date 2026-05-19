@@ -220,41 +220,99 @@ def _score_direct_initial(
     """
     Python-only initial scoring for a single direct lead.
     Returns (initial_score 0–10, breakdown_dict).
-    Leads with stage_score = 0 (MNC/public) are hard-disqualified from Phase 2.
+
+    Three layers of hard disqualification (score → 0):
+      1. MNC/public company stage (when Tavily enrichment was active)
+      2. Intern/trainee role title keywords
+      3. Dealbreaker keyword match (company name or role title)
+
+    Two scoring boosts on top of recency + role-match:
+      4. Sector fit boost  — small multiplier if job domain aligns with candidate's sector_fit
+      5. Salary floor kill — hard kill if compensation clearly stated below candidate's floor
     """
     stage_label = (match.get("company_stage_label") or "unknown").lower()
     stage_score = STAGE_SCORE_TABLE.get(stage_label, 7.0)
 
-    # Hard disqualifier — MNC or public company
+    # ── Hard disqualifier 1 — MNC or public company (stage enrichment path) ────
     if stage_score == 0.0:
         return 0.0, {
-            "stage":                  0.0,
-            "recency":                0.0,
-            "confidence_weight":      0.0,
-            "stage_label":            stage_label,
+            "stage":                   0.0,
+            "recency":                 0.0,
+            "confidence_weight":       0.0,
+            "stage_label":             stage_label,
             "excluded_by_dealbreaker": True,
+            "reason":                  "mnc/public via stage label",
         }
 
-    # Hard disqualifier — intern/trainee role for a non-fresher candidate
-    role_lower = match.get("role_title", "").lower()
+    role_lower    = (match.get("role_title", "") or "").lower()
+    company_lower = (match.get("company_name", "") or "").lower()
+
+    # ── Hard disqualifier 2 — intern/trainee role ────────────────────────────
     if any(kw in role_lower for kw in ("intern", "trainee", "apprentice")):
         return 0.0, {
-            "stage":                  stage_score,
-            "recency":                0.0,
-            "confidence_weight":      0.0,
-            "stage_label":            stage_label,
+            "stage":                   stage_score,
+            "recency":                 0.0,
+            "confidence_weight":       0.0,
+            "stage_label":             stage_label,
             "excluded_by_dealbreaker": True,
-            "reason":                 "intern/trainee role excluded for non-fresher",
+            "reason":                  "intern/trainee role excluded",
         }
 
+    # ── Hard disqualifier 3 — dealbreaker keyword match ──────────────────────
+    # Since Tavily company-stage enrichment is disabled (all stages = 'unknown'),
+    # this is now the PRIMARY mechanism for filtering MNCs and bad-fit companies.
+    # Checks: known MNC list (from s3_discover) + candidate's own dealbreaker strings.
+    dealbreaker_reason = _check_dealbreaker(
+        company_lower, role_lower,
+        match.get("description", "") or "",
+        candidate_model.dealbreakers,
+    )
+    if dealbreaker_reason:
+        return 0.0, {
+            "stage":                   stage_score,
+            "recency":                 0.0,
+            "confidence_weight":       0.0,
+            "stage_label":             stage_label,
+            "excluded_by_dealbreaker": True,
+            "reason":                  dealbreaker_reason,
+        }
+
+    # ── Hard disqualifier 4 — salary clearly below candidate floor ────────────
+    # Only triggers when job explicitly states salary AND it's far below floor.
+    comp_str = match.get("compensation_estimate") or ""
+    if comp_str and candidate_model.compensation_band:
+        parsed_max_lpa = _parse_salary_lpa_max(comp_str)
+        if parsed_max_lpa and parsed_max_lpa < (candidate_model.compensation_band.low_lpa * 0.60):
+            # Stated salary ceiling is less than 60% of candidate's floor — hard kill
+            return 0.0, {
+                "stage":                   stage_score,
+                "recency":                 0.0,
+                "confidence_weight":       0.0,
+                "stage_label":             stage_label,
+                "excluded_by_dealbreaker": True,
+                "reason":                  f"salary ceiling {parsed_max_lpa}L below candidate floor",
+            }
+
+    # ── Positive scoring ──────────────────────────────────────────────────────
     recency             = _recency_score(match.get("posted_at"))
     conf_weight, matched_role, matched_conf = _best_alias_match(
         match.get("role_title", ""),
         candidate_model.target_roles,
     )
 
-    score = (stage_score * 0.60 + recency * 0.40) * conf_weight
-    score = round(min(score, 10.0), 2)
+    # Sector fit boost: +15% if job domain matches candidate's preferred sectors.
+    # Applied as a multiplier AFTER the base formula so it can only boost, not rescue.
+    sector_boost = _sector_fit_boost(
+        company_lower,
+        match.get("description", "") or "",
+        candidate_model.sector_fit,
+    )
+
+    # Formula rebalanced: since company_stage is always 'unknown' (Tavily disabled),
+    # recency now carries more weight (0.50) and stage is reduced (0.50) until
+    # a new enrichment source is wired in.
+    base_score = (stage_score * 0.50 + recency * 0.50) * conf_weight * sector_boost
+    score      = round(min(base_score, 10.0), 2)
 
     return score, {
         "stage":                   stage_score,
@@ -263,8 +321,144 @@ def _score_direct_initial(
         "matched_role":            matched_role,
         "matched_confidence":      matched_conf,
         "stage_label":             stage_label,
+        "sector_boost":            round(sector_boost, 3),
         "excluded_by_dealbreaker": False,
     }
+
+
+# ── Phase 1A Helpers: Dealbreaker & Sector Signals ────────────────────────────
+
+# Known MNC/large-corp keyword patterns — supplement the candidate's own dealbreakers.
+# These are company-name substrings that reliably signal MNC/public companies.
+# Keep lower-case. Checked against company_name and role title.
+_MNC_COMPANY_SIGNALS: frozenset[str] = frozenset({
+    "infosys", "wipro", "tcs", "tata consultancy", "tech mahindra", "hcl technologies",
+    "accenture", "ibm", "deloitte", "pwc", "kpmg", "ey ", "ernst & young",
+    "capgemini", "cognizant", "mphasis", "hexaware", "mindtree",
+    "reliance", "tata", "aditya birla", "itc limited", "hdfc", "icici", "axis bank",
+    "sbi", "kotak", "amazon", "google", "microsoft", "meta", "apple", "oracle", "sap",
+    "salesforce", "adobe", "byju", "unacademy", "upgrad",
+    "taskus", "concentrix", "teleperformance",  # BPO / outsourcing
+})
+
+# Role-level signals that indicate bad-fit regardless of company.
+_BAD_ROLE_SIGNALS: tuple[str, ...] = (
+    "bpo", "call centre", "call center", "data entry", "telecaller",
+    "field sales", "field officer", "on-ground", "direct sales",
+    "recruitment consultant", "talent acquisition executive",  # staffing agency
+)
+
+
+def _check_dealbreaker(
+    company_lower: str,
+    role_lower: str,
+    description: str,
+    candidate_dealbreakers: list[str],
+) -> str | None:
+    """
+    Return a reason string if this lead matches any dealbreaker signal.
+    Returns None if the lead is clean.
+
+    Checks (in order):
+      1. Known MNC company name substring match
+      2. Bad role-type keyword in role title
+      3. Candidate's own dealbreaker strings (keyword extraction)
+    """
+    # 1. Known MNC company name substring
+    for signal in _MNC_COMPANY_SIGNALS:
+        if signal in company_lower:
+            return f"known MNC/large-corp: '{signal}' in company name"
+
+    # 2. Bad role type keyword in title
+    for kw in _BAD_ROLE_SIGNALS:
+        if kw in role_lower:
+            return f"bad role type: '{kw}' in role title"
+
+    # 3. Candidate's own dealbreakers — extract meaningful keywords (≥5 chars,
+    #    skip stop-words) and check them against company + role + description.
+    desc_lower    = description[:300].lower()
+    stop_words    = {"with", "roles", "role", "company", "companies", "type",
+                     "large", "that", "where", "based", "focus", "pure", "only",
+                     "and", "for", "the", "are", "not"}
+    for db_str in (candidate_dealbreakers or []):
+        keywords = [
+            w.strip("(),.'\";").lower()
+            for w in db_str.split()
+            if len(w.strip("(),.'\";")) >= 5
+            and w.strip("(),.'\";").lower() not in stop_words
+        ]
+        for kw in keywords:
+            if kw in company_lower or kw in role_lower or kw in desc_lower:
+                return f"candidate dealbreaker match: '{kw}' from '{db_str[:40]}'"
+
+    return None
+
+
+def _sector_fit_boost(
+    company_lower: str,
+    description: str,
+    sector_fit: list[str],
+) -> float:
+    """
+    Return a small multiplier (1.0–1.15) based on sector alignment.
+    Uses rapidfuzz partial_ratio against candidate's preferred sectors.
+    Returns 1.0 (neutral) if sector_fit is empty or no match found.
+    Returns 1.15 if any sector matches strongly (score ≥ 70).
+    Returns 1.07 if any sector matches partially (score 50–69).
+    """
+    if not sector_fit:
+        return 1.0
+
+    from rapidfuzz import fuzz
+
+    search_text = f"{company_lower} {description[:300].lower()}"
+    best_score  = 0.0
+
+    for sector in sector_fit:
+        s = fuzz.partial_ratio(sector.lower(), search_text)
+        if s > best_score:
+            best_score = s
+
+    if best_score >= 70:
+        return 1.15
+    if best_score >= 50:
+        return 1.07
+    return 1.0
+
+
+def _parse_salary_lpa_max(comp_str: str) -> float | None:
+    """
+    Parse a compensation_estimate string and return the UPPER bound in LPA.
+    Handles common Indian salary formats:
+      '8L - 12L', '8 LPA to 12 LPA', '₹8,00,000 - ₹12,00,000'
+      '8-12 Lakhs', '800000 - 1200000'
+    Returns None if parsing fails or string is empty/ambiguous.
+    """
+    if not comp_str:
+        return None
+    import re
+
+    # Normalise: strip currency symbols and commas
+    cleaned = comp_str.replace("₹", "").replace(",", "").replace("INR", "").strip()
+
+    # Pattern 1: raw LPA numbers like '8L', '8 LPA', '8 Lakhs'
+    lpa_pattern = re.compile(
+        r"(\d+(?:\.\d+)?)\s*(?:l|lpa|lakh|lakhs|l\.p\.a)",
+        re.IGNORECASE,
+    )
+    matches_lpa = lpa_pattern.findall(cleaned)
+    if matches_lpa:
+        values = [float(x) for x in matches_lpa]
+        return max(values)  # Return upper bound
+
+    # Pattern 2: raw rupee amounts like '800000 - 1200000'
+    number_pattern = re.compile(r"(\d{5,8})")
+    matches_num = number_pattern.findall(cleaned)
+    if matches_num:
+        values = [float(x) / 100_000 for x in matches_num]  # Convert to LPA
+        return max(values)
+
+    return None
 
 
 def _recency_score(posted_at) -> float:

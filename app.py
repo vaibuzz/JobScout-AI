@@ -977,12 +977,24 @@ def _run_searching():
         _goto("results")
         return
 
-    if db_status in ["discovering", "discovered", "ranking"]:
-        # Actors are running or have just finished — poll every 3 seconds.
-        st.warning(f"⏳ Pipeline is currently {db_status}... auto-refreshing.")
-        time.sleep(3)
+    if db_status == "discovering":
+        # Apify actors are still running — poll every 5 seconds.
+        st.info("🔍 **Step 1/3 — Discovering leads...** Apify is scraping LinkedIn & Wellfound. This takes 3–5 minutes.")
+        time.sleep(5)
         st.rerun()
         return
+
+    if db_status == "ranking":
+        # Stage 4 Gemini scoring is running — poll every 5 seconds.
+        st.info("🧠 **Step 2/3 — Ranking leads with AI...** Gemini is scoring your matches. Almost done!")
+        time.sleep(5)
+        st.rerun()
+        return
+
+    # "discovered" means Stage 3 finished but Stage 4 has NOT been called yet
+    # (happens when Streamlit re-rendered between Stage 3 and Stage 4).
+    # Fall through — the try/except block below will skip discover_leads and
+    # call rank_leads() directly.
 
     # ── Layer 0: Candidate-scoped session guard (fastest check — no DB hit) ────────
     # If THIS session already started the pipeline for THIS candidate, block
@@ -1007,48 +1019,50 @@ def _run_searching():
 
     try:
         with st.status("Searching for your opportunities…", expanded=True) as status:
-            st.write("**Stage 3** — Searching LinkedIn Jobs, Wellfound & founder posts…")
-            direct, indirect = discover_leads(cid, model.search_queries.model_dump())
 
-            # ── Safety valve: discover_leads may have been blocked by the DB guard ──
-            # (e.g. status was already 'ranked' from a prior run). In that case,
-            # skip rank_leads and load the already-scored results from the DB.
-            if not direct and not indirect:
-                from db.queries import get_candidate as _gc, get_matches_for_candidate as _gm
-                _cand = _gc(cid)
-                _status = _cand.get("pipeline_status") if _cand else None
-                if _status == "ranked":
-                    st.success("✅ Pipeline already complete — loading your results!")
-                    matches = _gm(cid)
-                    st.session_state.scored_leads = [
-                        {**m, "job_id": m.get("job_id")} for m in matches
-                    ]
-                    st.session_state.error_msg       = None
-                    st.session_state._is_searching   = False
-                    st.session_state._searching_cid  = None
-                    _goto("results")
-                    return
-                elif _status in ("discovering", "discovered", "ranking"):
-                    st.warning("⏳ Discovery still running — checking again in 5 seconds…")
-                    import time; time.sleep(5)
-                    st.rerun()
-                    return
-                # Otherwise 0 leads scraped — fall through to rank_leads(cid) which
-                # will return [] and show the empty results page gracefully.
-
-            # Check if we entered partial-result mode (some channels failed but
-            # we had enough leads to proceed — surface this to the user)
-            from pipeline.s3_discover import discovery_partial
-            if discovery_partial:
-                st.warning(
-                    f"⚠ Some scrape channels failed — ranking with "
-                    f"**{len(direct) + len(indirect)}** leads collected so far."
-                )
+            if db_status == "discovered":
+                # Stage 3 already completed on a previous render — skip directly to Stage 4.
+                st.write("✅ **Stage 3 complete** — leads already discovered. Proceeding to ranking…")
+                direct, indirect = [], []   # not needed — rank_leads reads from DB
             else:
-                st.write(
-                    f"✅ Found **{len(direct)}** formal listings + "
-                    f"**{len(indirect)}** founder signals"
-                )
+                st.write("**Stage 3** — Searching LinkedIn Jobs, Wellfound & founder posts…")
+                direct, indirect = discover_leads(cid, model.search_queries.model_dump(), model)
+
+                # ── Safety valve: discover_leads may have been blocked by the DB guard ──
+                # (e.g. status was already 'ranked' from a prior run). In that case,
+                # skip rank_leads and load the already-scored results from the DB.
+                if not direct and not indirect:
+                    from db.queries import get_candidate as _gc, get_matches_for_candidate as _gm
+                    _cand = _gc(cid)
+                    _status = _cand.get("pipeline_status") if _cand else None
+                    if _status == "ranked":
+                        st.success("✅ Pipeline already complete — loading your results!")
+                        matches = _gm(cid)
+                        st.session_state.scored_leads = [
+                            {**m, "job_id": m.get("job_id")} for m in matches
+                        ]
+                        st.session_state.error_msg       = None
+                        st.session_state._is_searching   = False
+                        st.session_state._searching_cid  = None
+                        _goto("results")
+                        return
+                    # Otherwise 0 leads scraped — fall through to rank_leads(cid) which
+                    # will return [] and show the empty results page gracefully.
+
+                # Check if we entered partial-result mode (some channels failed but
+                # we had enough leads to proceed — surface this to the user)
+                from pipeline.s3_discover import discovery_partial
+                if discovery_partial:
+                    st.warning(
+                        f"⚠ Some scrape channels failed — ranking with "
+                        f"**{len(direct) + len(indirect)}** leads collected so far."
+                    )
+                else:
+                    st.write(
+                        f"✅ Found **{len(direct)}** formal listings + "
+                        f"**{len(indirect)}** founder signals"
+                    )
+
             st.write("**Stage 4** — Scoring and ranking all leads with AI…")
             scored = rank_leads(cid, model)
             st.write(

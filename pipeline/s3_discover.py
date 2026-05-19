@@ -97,6 +97,7 @@ def _is_mnc(company: str) -> bool:
 def discover_leads(
     candidate_id: str,
     search_queries: dict,
+    candidate_model=None,   # CandidateModel — used for pre-scoring before the cap
 ) -> tuple[list[RawLead], list[RawLead]]:
     """
     Discover raw job leads for a candidate.
@@ -236,7 +237,7 @@ def discover_leads(
             len(failed_channels), total_raw, PARTIAL_RESULT_THRESHOLD,
         )
 
-    # Enrich + dedup + cap
+    # Enrich + dedup
     if direct_leads:
         direct_leads = _enrich_company_stages(direct_leads)
         direct_leads = _enrich_hiring_managers(direct_leads)
@@ -245,6 +246,41 @@ def discover_leads(
     indirect_leads = _dedup_within(indirect_leads)
     direct_leads, indirect_leads = _dedup_cross_channel(direct_leads, indirect_leads)
 
+    # ── Pre-score and sort direct leads BEFORE capping ──────────────────────────
+    # This ensures the cap keeps the BEST leads, not just the first N.
+    # Uses the same Phase 1A Python filter from s4_rank so the logic is
+    # consistent — MNCs, dealbreakers, and low-salary leads are ranked last
+    # and naturally fall outside the cap.
+    if len(direct_leads) > MAX_RAW_LEADS and candidate_model is not None:
+        try:
+            from pipeline.s4_rank import _score_direct_initial
+            scored_pairs = []
+            for lead in direct_leads:
+                # Build a minimal match-dict that _score_direct_initial can read
+                match_dict = {
+                    "role_title":           lead.role_title,
+                    "company_name":         lead.company_name,
+                    "company_stage_label":  lead.company_stage_label,
+                    "description":          lead.description,
+                    "compensation_estimate": lead.compensation_estimate,
+                    "posted_at":            lead.posted_at,
+                }
+                prescore, _ = _score_direct_initial(match_dict, candidate_model)
+                scored_pairs.append((prescore, lead))
+            # Sort descending — best leads first, MNC/dealbreaker kills (0.0) last
+            scored_pairs.sort(key=lambda x: x[0], reverse=True)
+            direct_leads = [lead for _, lead in scored_pairs]
+            log.info(
+                "S3: Pre-scored %d direct leads — top: %.2f | bottom: %.2f — cap will keep top %d",
+                len(direct_leads),
+                scored_pairs[0][0] if scored_pairs else 0,
+                scored_pairs[-1][0] if scored_pairs else 0,
+                MAX_RAW_LEADS,
+            )
+        except Exception as e:
+            log.warning("S3: Pre-scoring failed (%s) — falling back to position-based cap", e)
+
+    # Cap: keep best MAX_RAW_LEADS direct + MAX_RAW_LEADS//2 indirect
     direct_leads   = direct_leads[:MAX_RAW_LEADS]
     indirect_leads = indirect_leads[:MAX_RAW_LEADS // 2]
 
