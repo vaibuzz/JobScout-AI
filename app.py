@@ -1018,100 +1018,112 @@ def _run_searching():
     # Fall through — the try/except block below will skip discover_leads and
     # call rank_leads() directly.
 
-    # ── Layer 0: Candidate-scoped session guard (fastest check — no DB hit) ────────
-    # If THIS session already started the pipeline for THIS candidate, block
-    # immediately. This catches rerenders that slip between DB status transitions.
-    if st.session_state.get("_searching_cid") == cid:
-        st.warning("⏳ Pipeline already started for this candidate — please wait.")
-        time.sleep(3)
-        st.rerun()
-        return
+    # ── "discovered": Stage 3 done, Stage 4 not yet started ─────────────────
+    # CRITICAL: skip Layer 0 and Layer 3 for this state:
+    #  • Layer 0 (_searching_cid) is True from Stage 3 execution — would loop forever.
+    #  • Layer 3 (thread lock) may be held by the Stage 3 thread on Cloud — would loop.
+    if db_status != "discovered":
+        # ── Layer 0: session guard ────────────────────────────────────────────
+        if st.session_state.get("_searching_cid") == cid:
+            st.warning("⏳ Pipeline already started for this candidate — please wait.")
+            time.sleep(3)
+            st.rerun()
+            return
 
-    # ── Layer 3: In-process thread lock (last line of defence) ───────────────
-    if not _PIPELINE_LOCK.acquire(blocking=False):
-        st.warning("⏳ Pipeline is already running — please wait for results.")
-        time.sleep(3)
-        st.rerun()
-        return
+        # ── Layer 3: thread lock ──────────────────────────────────────────────
+        if not _PIPELINE_LOCK.acquire(blocking=False):
+            st.warning("⏳ Pipeline is already running — please wait for results.")
+            time.sleep(3)
+            st.rerun()
+            return
 
-    # ── Stamp session state BEFORE launching actors ────────────────────────────
-    # Any rerender from this point on will be caught by Layer 0 above.
-    st.session_state._is_searching  = True
-    st.session_state._searching_cid = cid
+        # Stamp session BEFORE actors fire
+        st.session_state._is_searching  = True
+        st.session_state._searching_cid = cid
+
+    # ── Run Stage 3 + Stage 4 ─────────────────────────────────────────────────
+    # IMPORTANT: _goto() raises RerunException. On Streamlit Cloud this is caught
+    # by `except Exception` → wrong redirect. Buffer results and navigate AFTER.
+    _scored   = None
+    _error    = None
+    _goto_url = None
 
     try:
         with st.status("Searching for your opportunities…", expanded=True) as status:
 
             if db_status == "discovered":
-                # Stage 3 already completed on a previous render — skip directly to Stage 4.
+                # Stage 3 already completed — skip directly to Stage 4.
                 st.write("✅ **Stage 3 complete** — leads already discovered. Proceeding to ranking…")
-                direct, indirect = [], []   # not needed — rank_leads reads from DB
             else:
                 st.write("**Stage 3** — Searching LinkedIn Jobs, Wellfound & founder posts…")
                 direct, indirect = discover_leads(cid, model.search_queries.model_dump(), model)
 
-                # ── Safety valve: discover_leads may have been blocked by the DB guard ──
-                # (e.g. status was already 'ranked' from a prior run). In that case,
-                # skip rank_leads and load the already-scored results from the DB.
                 if not direct and not indirect:
                     from db.queries import get_candidate as _gc, get_matches_for_candidate as _gm
                     _cand = _gc(cid)
-                    _status = _cand.get("pipeline_status") if _cand else None
-                    if _status == "ranked":
+                    if (_cand or {}).get("pipeline_status") == "ranked":
                         st.success("✅ Pipeline already complete — loading your results!")
                         matches = _gm(cid)
-                        st.session_state.scored_leads = [
-                            {**m, "job_id": m.get("job_id")} for m in matches
-                        ]
-                        st.session_state.error_msg       = None
-                        st.session_state._is_searching   = False
-                        st.session_state._searching_cid  = None
-                        _goto("results")
-                        return
-                    # Otherwise 0 leads scraped — fall through to rank_leads(cid) which
-                    # will return [] and show the empty results page gracefully.
+                        _scored   = matches
+                        _goto_url = "results"
+                        status.update(label="Already complete!", state="complete", expanded=False)
 
-                # Check if we entered partial-result mode (some channels failed but
-                # we had enough leads to proceed — surface this to the user)
-                from pipeline.s3_discover import discovery_partial
-                if discovery_partial:
-                    st.warning(
-                        f"⚠ Some scrape channels failed — ranking with "
-                        f"**{len(direct) + len(indirect)}** leads collected so far."
-                    )
-                else:
-                    st.write(
-                        f"✅ Found **{len(direct)}** formal listings + "
-                        f"**{len(indirect)}** founder signals"
-                    )
+                if _scored is None:
+                    from pipeline.s3_discover import discovery_partial
+                    if discovery_partial:
+                        st.warning(
+                            f"⚠ Some scrape channels failed — ranking with "
+                            f"**{len(direct) + len(indirect)}** leads collected so far."
+                        )
+                    else:
+                        st.write(
+                            f"✅ Found **{len(direct)}** formal listings + "
+                            f"**{len(indirect)}** founder signals"
+                        )
 
-            st.write("**Stage 4** — Scoring and ranking all leads with AI…")
-            scored = rank_leads(cid, model)
-            st.write(
-                f"✅ **{len(scored)}** leads ranked — top fit score: {scored[0].fit_score:.1f}/100"
-                if scored else "✅ Ranking complete"
-            )
-            status.update(label="Ranking complete!", state="complete", expanded=False)
-
-        st.session_state.scored_leads = [
-            {**lead.model_dump(), "job_id": lead.job_id}
-            for lead in scored
-        ]
-        st.session_state.error_msg   = None
-        st.session_state._is_searching  = False
-        st.session_state._searching_cid = None   # clear so a fresh run is allowed later
-        _goto("results")
+            if _scored is None:
+                st.write("**Stage 4** — Scoring and ranking all leads with AI…")
+                scored = rank_leads(cid, model)
+                st.write(
+                    f"✅ **{len(scored)}** leads ranked — top fit score: {scored[0].fit_score:.1f}/100"
+                    if scored else "✅ Ranking complete"
+                )
+                status.update(label="Ranking complete!", state="complete", expanded=False)
+                _scored   = scored
+                _goto_url = "results"
+            else:
+                status.update(label="Already complete!", state="complete", expanded=False)
 
     except Exception as exc:
-        log.exception("S3/S4 failed")
-        st.session_state.error_msg      = str(exc)
-        st.session_state._is_searching  = False
-        st.session_state._searching_cid = None   # clear on failure so user can retry
-        _goto("confirmed")
+        log.exception("S3/S4 failed: %s", exc)
+        _error    = str(exc)
+        _goto_url = "confirmed"
 
     finally:
-        # Always release lock — even on exception — so future runs are not permanently blocked
-        _PIPELINE_LOCK.release()
+        # Release lock only if we acquired it (not acquired for 'discovered' bypass)
+        if db_status != "discovered":
+            try:
+                _PIPELINE_LOCK.release()
+            except RuntimeError:
+                pass
+
+    # ── Navigate AFTER try/except — RerunException cannot be caught here ──────
+    if _goto_url == "results" and _scored is not None:
+        st.session_state.scored_leads = [
+            ({**lead.model_dump(), "job_id": lead.job_id}
+             if hasattr(lead, "model_dump")
+             else {**lead, "job_id": lead.get("job_id")})
+            for lead in _scored
+        ]
+        st.session_state.error_msg      = None
+        st.session_state._is_searching  = False
+        st.session_state._searching_cid = None
+        _goto("results")
+    elif _goto_url == "confirmed":
+        st.session_state.error_msg      = _error or "Pipeline failed — please try again."
+        st.session_state._is_searching  = False
+        st.session_state._searching_cid = None
+        _goto("confirmed")
 
 
 # ── VIEW: input ───────────────────────────────────────────────────────────────
