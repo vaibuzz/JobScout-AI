@@ -905,9 +905,8 @@ def _run_profiling():
     pdf  = st.session_state._pending_pdf
     name = st.session_state._pending_name
 
-    # ── Guard 1: already complete in this session — go straight to confirmed ───
-    # If profiling already ran successfully (candidate_model is set), skip
-    # directly to confirmed page instead of re-running the entire pipeline.
+    # ── Guard: already complete in this session ───────────────────────────────
+    # If profiling already ran (candidate_model is set), go straight to confirmed.
     if (
         st.session_state.get("candidate_model") is not None
         and st.session_state.get("candidate_id") is not None
@@ -915,15 +914,15 @@ def _run_profiling():
         _goto("confirmed")
         return
 
-    # ── Guard 2: thread lock — prevents duplicate Apify actor fires ───────────
-    # Uses the same _PIPELINE_LOCK as Stage 3/4.  acquire(blocking=False) means:
-    # if another thread already holds the lock, we poll and wait — but we do NOT
-    # show a static warning and return (which caused the infinite stuck state).
-    if not _PIPELINE_LOCK.acquire(blocking=False):
-        st.info("🔍 **Step 1/2 — Scraping LinkedIn profile...** Apify actor is running.")
-        import time; time.sleep(4)
-        st.rerun()
-        return
+    # ── Run Stage 1 + Stage 2 ─────────────────────────────────────────────────
+    # IMPORTANT: _goto() calls st.rerun() which raises RerunException.
+    # If called inside a st.status() block, it gets caught by the except clause
+    # and redirects to "input" instead of "confirmed". Fix: store results
+    # in local variables, exit the with block, THEN redirect.
+    _result_profile    = None
+    _result_cid        = None
+    _result_model      = None
+    _error             = None
 
     try:
         with st.status("Analysing your profile…", expanded=True) as status:
@@ -939,23 +938,27 @@ def _run_profiling():
             st.write(f"✅ {len(model.target_roles)} target roles identified")
             status.update(label="Profile analysed!", state="complete", expanded=False)
 
-        st.session_state.candidate_id    = cid
-        st.session_state.student_profile = profile
-        st.session_state.candidate_model = model
-        st.session_state.error_msg       = None
-        _goto("confirmed")
+            # Store in locals — do NOT call _goto() here (RerunException caught by except)
+            _result_profile = profile
+            _result_cid     = cid
+            _result_model   = model
 
     except Exception as exc:
-        log.exception("S1/S2 failed")
-        st.session_state.error_msg = str(exc)
+        log.exception("S1/S2 failed: %s", exc)
+        _error = str(exc)
+
+    # ── Navigate AFTER st.status() block is closed ────────────────────────────
+    if _result_model is not None:
+        st.session_state.candidate_id    = _result_cid
+        st.session_state.student_profile = _result_profile
+        st.session_state.candidate_model = _result_model
+        st.session_state.error_msg       = None
+        _goto("confirmed")   # Safe to call here — outside the with block
+    else:
+        st.session_state.error_msg = _error or "Profile analysis failed — please try again."
         _goto("input")
 
-    finally:
-        # Always release the lock so a fresh run is allowed next time
-        try:
-            _PIPELINE_LOCK.release()
-        except RuntimeError:
-            pass  # Lock was not acquired — safe to ignore
+
 
 
 
